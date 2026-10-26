@@ -40,6 +40,7 @@ export interface NeighborRow {
 }
 
 export const MAX_DEPTH = 6;
+export const MAX_PATHS = 10_000;
 
 function invalid(message: string, field: string): RemoraError {
   return new RemoraError('invalid_param', message, { field });
@@ -68,6 +69,27 @@ async function typeSets(
   return { out: [...out], in: [...inn] };
 }
 
+interface PathRec {
+  nodes: string[];
+  rels: string[];
+}
+
+/** Shortest first, then by relation row ids (R14). */
+function comparePaths(x: PathRec, y: PathRec): number {
+  if (x.rels.length !== y.rels.length) return x.rels.length - y.rels.length;
+  for (let i = 0; i < x.rels.length; i++) {
+    const d = BigInt(x.rels[i]!) - BigInt(y.rels[i]!);
+    if (d !== 0n) return d < 0n ? -1 : 1;
+  }
+  return 0;
+}
+
+function pathEdge(side: 'src' | 'dst', other: 'dst' | 'src', typesParam: number, whenSql: string): string {
+  return `SELECT rel.${other} AS next, rel.id AS rid FROM relation rel
+      WHERE rel.${side} = p.entity_id AND rel.relation_type_id = ANY($${typesParam}::smallint[])
+        AND rel.retracted_at IS NULL AND ${whenSql}`;
+}
+
 interface Level {
   id: string;
   depth: number;
@@ -92,7 +114,6 @@ export async function neighbors(
   const dir = a.orderBy?.dir ?? 'asc';
   if (dir !== 'asc' && dir !== 'desc') throw invalid('order_by.dir must be asc or desc', 'order_by');
   const limit = clampLimit(a.limit);
-  if (a.paths) throw invalid('paths is not supported yet', 'paths');
 
   const start = await requireEntity(db, a.entity);
   const types = await typeSets(db, a.relationTypes, direction);
@@ -109,24 +130,58 @@ export async function neighbors(
     `SELECT rel.${other} AS next FROM relation rel
       WHERE rel.${side} = r.entity_id AND rel.relation_type_id = ANY($${typesParam}::smallint[])
         AND rel.retracted_at IS NULL AND ${w.sql}`;
-  const levelRes = await db.query<{ entity_id: string; depth: number }>(
-    `WITH RECURSIVE reach(entity_id, depth) AS (
-       SELECT $1::bigint, 0
-       UNION
-       SELECT n.next, r.depth + 1
-         FROM reach r
-        CROSS JOIN LATERAL (
-          ${edge('src', 'dst', 2)}
-          UNION ALL
-          ${edge('dst', 'src', 3)}
-        ) n
-        WHERE r.depth < $4::int
-     )
-     SELECT entity_id, min(depth) AS depth FROM reach GROUP BY entity_id`,
-    [start.entityId.toString(), types.out, types.in, depth, ...w.params],
-  );
   const startId = start.entityId.toString();
-  const levels: Level[] = levelRes.rows.map((r) => ({ id: r.entity_id, depth: Number(r.depth) }));
+  const pathsByEntity = new Map<string, PathRec[]>();
+  let levels: Level[];
+  if (a.paths) {
+    // R14: enumerate simple paths; the LIMIT lets PG stop the recursion early.
+    const pathRes = await db.query<{ entity_id: string; depth: number; nodes: string[]; rels: string[] }>(
+      `WITH RECURSIVE paths(entity_id, depth, nodes, rels) AS (
+         SELECT $1::bigint, 0, ARRAY[$1::bigint], ARRAY[]::bigint[]
+         UNION ALL
+         SELECT n.next, p.depth + 1, p.nodes || n.next, p.rels || n.rid
+           FROM paths p
+          CROSS JOIN LATERAL (
+            ${pathEdge('src', 'dst', 2, w.sql)}
+            UNION ALL
+            ${pathEdge('dst', 'src', 3, w.sql)}
+          ) n
+          WHERE p.depth < $4::int AND NOT n.next = ANY(p.nodes)
+       )
+       SELECT entity_id, depth, nodes, rels FROM paths WHERE depth > 0 LIMIT ${MAX_PATHS + 1}`,
+      [startId, types.out, types.in, depth, ...w.params],
+    );
+    if (pathRes.rows.length > MAX_PATHS) {
+      throw new RemoraError('too_many_paths', `more than ${MAX_PATHS} paths; reduce depth or filter relation types`, {
+        limit: MAX_PATHS,
+      });
+    }
+    for (const r of pathRes.rows) {
+      const list = pathsByEntity.get(r.entity_id) ?? [];
+      list.push({ nodes: r.nodes, rels: r.rels });
+      pathsByEntity.set(r.entity_id, list);
+    }
+    levels = [{ id: startId, depth: 0 }];
+    for (const [id, list] of pathsByEntity) levels.push({ id, depth: Math.min(...list.map((p) => p.rels.length)) });
+  } else {
+    const levelRes = await db.query<{ entity_id: string; depth: number }>(
+      `WITH RECURSIVE reach(entity_id, depth) AS (
+         SELECT $1::bigint, 0
+         UNION
+         SELECT n.next, r.depth + 1
+           FROM reach r
+          CROSS JOIN LATERAL (
+            ${edge('src', 'dst', 2)}
+            UNION ALL
+            ${edge('dst', 'src', 3)}
+          ) n
+          WHERE r.depth < $4::int
+       )
+       SELECT entity_id, min(depth) AS depth FROM reach GROUP BY entity_id`,
+      [startId, types.out, types.in, depth, ...w.params],
+    );
+    levels = levelRes.rows.map((r) => ({ id: r.entity_id, depth: Number(r.depth) }));
+  }
   const reachable = levels.filter((l) => l.id !== startId);
   const total = reachable.length;
   if (total === 0) return { rows: [], total: 0, truncated: false };
@@ -164,7 +219,7 @@ export async function neighbors(
 
   // 3. via + via_count per page entity.
   const vw = whenClause(a.when, 7);
-  const via = await db.query<{
+  const via = a.paths ? { rows: [] } : await db.query<{
     entity_id: string;
     type: string;
     pred_key: string;
@@ -204,6 +259,53 @@ export async function neighbors(
       time: formatTime(registry, v.time_axis, v.lo, v.hi),
     };
     row.viaCount = Number(v.cnt);
+  }
+
+  // 3b. paths for the page.
+  if (a.paths) {
+    const relIds = new Set<string>();
+    const nodeIds = new Set<string>();
+    for (const id of pageIds) {
+      for (const p of pathsByEntity.get(id)!) {
+        p.rels.forEach((x) => relIds.add(x));
+        p.nodes.forEach((x) => nodeIds.add(x));
+      }
+    }
+    const relRes = await db.query<{
+      id: string;
+      relation_id: string;
+      type: string;
+      time_axis: number | null;
+      lo: string | null;
+      hi: string | null;
+    }>(
+      `SELECT r.id, r.relation_id, rt.name AS type, r.time_axis,
+              lower(r.time_span)::text AS lo, upper(r.time_span)::text AS hi
+         FROM relation r JOIN relation_type rt ON rt.id = r.relation_type_id
+        WHERE r.id = ANY($1::bigint[])`,
+      [[...relIds]],
+    );
+    const keyRes = await db.query<{ entity_id: string; key: string }>(
+      'SELECT entity_id, key FROM entity WHERE entity_id = ANY($1::bigint[])',
+      [[...nodeIds]],
+    );
+    const relById = new Map(relRes.rows.map((r) => [r.id, r]));
+    const keyById = new Map(keyRes.rows.map((r) => [r.entity_id, r.key]));
+    for (const [i, id] of pageIds.entries()) {
+      const list = [...pathsByEntity.get(id)!].sort(comparePaths);
+      rows[i]!.paths = list.map((p) =>
+        p.rels.map((rid, k): NeighborStep => {
+          const r = relById.get(rid)!;
+          return {
+            relation: r.type,
+            from: keyById.get(p.nodes[k]!)!,
+            to: keyById.get(p.nodes[k + 1]!)!,
+            relationId: BigInt(r.relation_id),
+            time: formatTime(registry, r.time_axis, r.lo, r.hi),
+          };
+        }),
+      );
+    }
   }
 
   // 4. properties for the page.

@@ -4,7 +4,7 @@ import { apply } from '../src/api/apply.js';
 import { query } from '../src/api/query.js';
 import { runMigrations } from '../src/db/migrate.js';
 import type { PluginRegistry } from '../src/plugins/registry.js';
-import { neighbors, type NeighborsArgs } from '../src/services/neighbors.js';
+import { MAX_PATHS, neighbors, type NeighborsArgs } from '../src/services/neighbors.js';
 import { parseWhen } from '../src/services/time.js';
 import { seedAxes } from './helpers/axes.js';
 import { seedBasics } from './helpers/seed.js';
@@ -177,7 +177,6 @@ describe('neighbors', () => {
       expect(await code({ limit: 500 })).toBe('ok');
       expect(await code({ direction: 'up' as 'out' })).toBe('invalid_param');
       expect(await code({ orderBy: { property: 'height', dir: 'up' as 'asc' } })).toBe('invalid_param');
-      expect(await code({ paths: true })).toBe('invalid_param');
     });
   });
 
@@ -199,6 +198,121 @@ describe('neighbors', () => {
       });
       const bad = await query(pool, reg, { ops: [{ op: 'neighbors', entity: 'bob', order_by: 'height' }] });
       expect(bad.ok).toBe(false);
+    });
+  });
+});
+
+describe('neighbors paths', () => {
+  it('lists simple paths per relation row, shortest first', async () => {
+    await withDb(async ({ nb }) => {
+      const r = await nb({ relationTypes: ['friend_of'], depth: 2, paths: true });
+      expect(names(r)).toEqual(['carl', 'dave']);
+      expect(r.total).toBe(2);
+      const carl = r.rows[0]!;
+      expect(carl.depth).toBe(1);
+      expect('via' in carl).toBe(false);
+      expect('viaCount' in carl).toBe(false);
+      expect(carl.paths).toHaveLength(2);
+      for (const p of carl.paths!) {
+        expect(p).toHaveLength(1);
+        expect(p[0]).toMatchObject({ relation: 'friend_of', from: 'bob', to: 'carl' });
+      }
+      expect(new Set(carl.paths!.map((p) => p[0]!.relationId)).size).toBe(2);
+      const dave = r.rows[1]!;
+      expect(dave.depth).toBe(2);
+      expect(dave.paths).toHaveLength(2);
+      for (const p of dave.paths!) {
+        expect(p).toHaveLength(2);
+        expect(p[0]).toMatchObject({ from: 'bob', to: 'carl' });
+        expect(p[1]).toMatchObject({ from: 'carl', to: 'dave', time: { axis: 'game_day', from: 100, to: 200 } });
+      }
+    });
+  });
+
+  it('steps are reported in traversal order for reverse traversal', async () => {
+    await withDb(async ({ nb }) => {
+      const r = await nb({ entity: 'dave', relationTypes: ['friend_of'], paths: true });
+      expect(r.rows).toHaveLength(1);
+      expect(r.rows[0]!.entity).toBe('carl');
+      expect(r.rows[0]!.paths![0]![0]).toMatchObject({ relation: 'friend_of', from: 'dave', to: 'carl' });
+    });
+  });
+
+  it('ranks entities with order_by and limit', async () => {
+    await withDb(async ({ nb }) => {
+      const r = await nb({
+        relationTypes: ['friend_of'],
+        depth: 2,
+        paths: true,
+        orderBy: { property: 'height', dir: 'desc' },
+        limit: 1,
+        include: ['height'],
+      });
+      expect(names(r)).toEqual(['dave']);
+      expect(r.total).toBe(2);
+      expect(r.truncated).toBe(true);
+      expect(r.rows[0]!.properties).toEqual({ height: [190] });
+    });
+  });
+
+  it('maps to snake_case rows through query()', async () => {
+    await withDb(async ({ pool, reg }) => {
+      const r = await query(pool, reg, {
+        ops: [{ op: 'neighbors', entity: 'bob', relation_types: ['works_at'], direction: 'out', paths: true }],
+      });
+      if (!r.ok) throw new Error(JSON.stringify(r.error));
+      const res = r.results[0] as { rows: Record<string, unknown>[] };
+      // one step per relation row: acme's relation is stored on two axes
+      const step = (time: unknown) => ({
+        relation: 'works_at',
+        from: 'bob',
+        to: 'acme',
+        relation_id: expect.any(Number),
+        time,
+      });
+      expect(res.rows[0]).toEqual({
+        entity: 'acme',
+        depth: 1,
+        paths: [[step({ axis: 'game_day', from: 1 })], [step({ axis: 'real', from: 1 })]],
+      });
+    });
+  });
+
+  async function buildHub(pool: pg.Pool, leaves: number): Promise<void> {
+    await pool.query(
+      `INSERT INTO entity (key)
+         SELECT 'hub' UNION ALL SELECT 'm' || g FROM generate_series(1, 100) g
+         UNION ALL SELECT 'l' || g FROM generate_series(1, $1::int) g`,
+      [leaves],
+    );
+    await pool.query(
+      `WITH t AS (SELECT id FROM relation_type WHERE name = 'knows'),
+            hub AS (SELECT entity_id FROM entity WHERE key = 'hub'),
+            ms AS (SELECT entity_id FROM entity WHERE key LIKE 'm%'),
+            ls AS (SELECT entity_id FROM entity WHERE key LIKE 'l%'),
+            pairs AS (
+              SELECT hub.entity_id AS s, ms.entity_id AS d FROM hub, ms
+              UNION ALL SELECT ms.entity_id, ls.entity_id FROM ms, ls)
+       INSERT INTO relation (relation_id, relation_type_id, src, dst)
+       SELECT row_number() OVER () + 1000000, t.id, pairs.s, pairs.d FROM pairs, t`,
+    );
+  }
+
+  it('allows exactly MAX_PATHS paths and rejects one more', async () => {
+    expect(MAX_PATHS).toBe(10_000);
+    await withDb(async ({ pool, nb }) => {
+      await buildHub(pool, 99);
+      const ok = await nb({ entity: 'hub', relationTypes: ['knows'], depth: 2, paths: true, limit: 200 });
+      expect(ok.total).toBe(199);
+      expect(ok.rows.reduce((n, x) => n + x.paths!.length, 0)).toBe(10_000);
+    });
+    await withDb(async ({ pool, nb }) => {
+      await buildHub(pool, 100);
+      const err = await nb({ entity: 'hub', relationTypes: ['knows'], depth: 2, paths: true }).catch((e) => e);
+      expect(err.code).toBe('too_many_paths');
+      expect(err.details.limit).toBe(10_000);
+      const plain = await nb({ entity: 'hub', relationTypes: ['knows'], depth: 2 });
+      expect(plain.total).toBe(200);
     });
   });
 });

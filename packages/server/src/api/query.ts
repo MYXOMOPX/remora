@@ -80,6 +80,17 @@ function neighborRow(r: NeighborRow): Obj {
     };
   }
   if (r.viaCount !== undefined) out.via_count = r.viaCount;
+  if (r.paths !== undefined) {
+    out.paths = r.paths.map((p) =>
+      p.map((s) => ({
+        relation: s.relation,
+        from: s.from,
+        to: s.to,
+        relation_id: Number(s.relationId),
+        time: s.time,
+      })),
+    );
+  }
   if (r.properties !== undefined) out.properties = r.properties;
   return out;
 }
