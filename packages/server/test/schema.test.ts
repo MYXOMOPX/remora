@@ -172,7 +172,33 @@ describe('schema constraints', () => {
           [eventId, s.axes.gameDay, span],
         );
       await expect(ins('[5,7)')).rejects.toMatchObject({ code: '23514' });
+      await expect(ins('[5,)')).rejects.toMatchObject({ code: '23514' });
       await ins('[5,6)');
+    }));
+
+  it('empty time_span rejected on property_version, relation and event_time', () =>
+    withDb(async (db, s) => {
+      await expect(
+        insertProp(db, { entity: s.bobId, type: s.types.jobTitle, axis: s.axes.gameDay, span: 'empty' }),
+      ).rejects.toMatchObject({ code: '23514' });
+      await db.query(
+        `INSERT INTO relation_type (name, description, directed) VALUES ('knows', 'Знаком.', false)`,
+      );
+      await expect(
+        db.query(
+          `INSERT INTO relation (relation_id, relation_type_id, src, dst, time_axis, time_span)
+           VALUES (1, 1, $1, $1, $2, 'empty'::int8range)`,
+          [s.bobId, s.axes.gameDay],
+        ),
+      ).rejects.toMatchObject({ code: '23514' });
+      const ev = await db.query<{ id: number }>(`INSERT INTO event (summary) VALUES ('Событие') RETURNING id`);
+      await expect(
+        db.query(
+          `INSERT INTO event_time (event_id, time_axis, time_span, instant)
+           VALUES ($1, $2, 'empty'::int8range, false)`,
+          [ev.rows[0]!.id, s.axes.gameDay],
+        ),
+      ).rejects.toMatchObject({ code: '23514' });
     }));
 
   it('event_entity role defaults', () =>

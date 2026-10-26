@@ -29,12 +29,13 @@ export interface TimeAxisInfo {
 
 const VALUE_TYPES: readonly string[] = ['number', 'text', 'date', 'bool', 'json'];
 
-/** Lowercase, whitespace to `_`, drop everything except Unicode letters/digits/`_`, collapse `_`, trim `_`. */
+/** Lowercase, whitespace to `_`, NFC first, drop everything except Unicode letters/marks/digits/`_`, collapse `_`, trim `_`. */
 export function normalizeName(raw: string): string {
   const name = raw
+    .normalize('NFC')
     .toLowerCase()
     .replace(/\s+/gu, '_')
-    .replace(/[^\p{L}\p{N}_]/gu, '')
+    .replace(/[^\p{L}\p{M}\p{N}_]/gu, '')
     .replace(/_+/g, '_')
     .replace(/^_|_$/g, '');
   if (name === '') {

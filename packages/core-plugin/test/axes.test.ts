@@ -28,6 +28,26 @@ describe('core axes', () => {
     expect(real.decode(1_790_812_800n)).toBe('2026-10-01T00:00:00.000Z');
     expect(() => real.encode('2026-10-01')).toThrow(expect.objectContaining({ code: 'invalid_time' }));
   });
+  it('datetime rejects impossible dates instead of rolling over', () => {
+    const real = buildAxis({ name: 'real', kind: 'datetime', unit: 'seconds' });
+    for (const bad of [
+      '2026-02-30T00:00:00Z', '2026-02-31T00:00:00Z', '2026-02-29T00:00:00Z', '2026-04-31T00:00:00Z',
+      '2026-01-01T24:00:00Z', '2026-13-01T00:00:00Z', '2026-00-10T00:00:00Z', '2026-01-00T00:00:00Z',
+      '2026-01-01T00:60:00Z', '2026-01-01T00:00:60Z', '2026-01-01T00:00:00+24:00', '2026-01-01T00:00:00+03:60',
+    ])
+      expect(() => real.encode(bad), bad).toThrow(expect.objectContaining({ code: 'invalid_time' }));
+    expect(real.decode(real.encode('2028-02-29T00:00:00Z'))).toBe('2028-02-29T00:00:00.000Z');
+    expect(real.encode('2026-01-01T23:59:59Z')).toBe(1_767_311_999n);
+  });
+  it('packed axis whose radix product does not fit in int8 is invalid_config', () => {
+    const three = (max: number) => ({ name: 'p', kind: 'packed' as const, components: [
+      { name: 'a', max }, { name: 'b', max }, { name: 'c', max }] });
+    expect(() => buildAxis(three(999_999_999))).toThrow(expect.objectContaining({ code: 'invalid_config' }));
+    // 2^21 radix each: 2^63 total leaves no room for t+1 headroom
+    expect(() => buildAxis(three(2 ** 21 - 1))).toThrow(expect.objectContaining({ code: 'invalid_config' }));
+    expect(() => buildAxis(three(2 ** 21 - 2))).not.toThrow();
+    expect(() => buildAxis(three(999_999))).not.toThrow();
+  });
   it('integer axis', () => {
     const day = buildAxis({ name: 'game_day', kind: 'integer' });
     expect(day.encode(292)).toBe(292n);

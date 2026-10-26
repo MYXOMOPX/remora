@@ -16,7 +16,21 @@ const DEFAULT_INTEGER_DESCRIPTION =
 const DEFAULT_DATETIME_DESCRIPTION =
   'Календарная шкала времени: значение — строка ISO-8601 с часовым поясом (Z или смещение), например 2026-01-01T00:00:00Z.';
 
-const ISO_WITH_ZONE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:\d{2})$/;
+const ISO_WITH_ZONE =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|[+-](\d{2}):(\d{2}))$/;
+
+/** Calendar/clock ranges that Date.parse would otherwise silently roll over. */
+function isValidIso(value: string): boolean {
+  const m = ISO_WITH_ZONE.exec(value);
+  if (!m) return false;
+  const [year, month, day, hour, minute, second, offH, offM] = [1, 2, 3, 4, 5, 6, 8, 9].map((i) =>
+    m[i] === undefined ? 0 : Number(m[i]),
+  ) as [number, number, number, number, number, number, number, number];
+  if (month < 1 || month > 12 || day < 1) return false;
+  const leap = (year % 4 === 0 && year % 100 !== 0) || year % 400 === 0;
+  const dim = [31, leap ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1]!;
+  return day <= dim && hour <= 23 && minute <= 59 && second <= 59 && offH <= 23 && offM <= 59;
+}
 
 function invalid(axis: string, reason: string): RemoraError {
   return new RemoraError('invalid_time', `Недопустимое значение для шкалы «${axis}»: ${reason}`, { axis, reason });
@@ -52,6 +66,7 @@ function buildDatetime(cfg: AxisConfig & { kind: 'datetime' }): TimeAxisDef {
       if (typeof value !== 'string' || !ISO_WITH_ZONE.test(value)) {
         throw invalid(cfg.name, 'ожидается строка ISO-8601 с часовым поясом (Z или смещение)');
       }
+      if (!isValidIso(value)) throw invalid(cfg.name, 'несуществующая дата или время');
       const ms = Date.parse(value);
       if (Number.isNaN(ms)) throw invalid(cfg.name, 'некорректная дата');
       const big = BigInt(ms);
@@ -85,6 +100,8 @@ function buildPacked(cfg: AxisConfig & { kind: 'packed' }): TimeAxisDef {
   const radices = comps.map((c) => BigInt(c.max) + 1n);
   const names = comps.map((c) => c.name);
   const total = radices.reduce((a, b) => a * b, 1n);
+  // верхняя граница мгновенного события t+1 тоже должна помещаться в int8
+  if (total > 2n ** 63n - 1n) throw bad('произведение радиксов не помещается в int8 (bigint)');
   const first = names[0]!;
   const listing = comps.map((c) => `${c.name} (0..${c.max})`).join(', ');
   const description =

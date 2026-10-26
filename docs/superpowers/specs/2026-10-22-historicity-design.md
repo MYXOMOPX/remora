@@ -108,6 +108,7 @@ CREATE TABLE property_version (
   retracted_at          timestamptz,     -- отозванная запись (раздел 6, «Отзыв»)
   retracted_evidence_id bigint REFERENCES evidence_log(id),
   CHECK ((time_axis IS NULL) = (time_span IS NULL)),
+  CHECK (NOT isempty(time_span)),             -- пустой интервал никогда не действует, а EXCLUDE его пропускает
   FOREIGN KEY (property_type_id, single_valued)
     REFERENCES property_type (id, single_valued),
   EXCLUDE USING gist (
@@ -183,7 +184,8 @@ CREATE TABLE relation (
   recorded_at      timestamptz NOT NULL DEFAULT now(),
   retracted_at          timestamptz,
   retracted_evidence_id bigint REFERENCES evidence_log(id),
-  CHECK ((time_axis IS NULL) = (time_span IS NULL))
+  CHECK ((time_axis IS NULL) = (time_span IS NULL)),
+  CHECK (NOT isempty(time_span))
 );
 CREATE INDEX relation_src_idx ON relation (src, relation_type_id, time_axis);
 CREATE INDEX relation_dst_idx ON relation (dst, relation_type_id, time_axis);
@@ -339,7 +341,9 @@ CREATE TABLE event_time (                      -- когда произошло,
   time_axis smallint  NOT NULL REFERENCES time_axis(id),
   time_span int8range NOT NULL,
   instant   boolean   NOT NULL,                -- true: мгновенное событие, time_span = [t, t+1)
-  PRIMARY KEY (event_id, time_axis)
+  PRIMARY KEY (event_id, time_axis),
+  CHECK (NOT isempty(time_span)),
+  CHECK ((NOT instant) OR (lower(time_span) IS NOT NULL AND upper(time_span) IS NOT NULL AND upper(time_span) = lower(time_span) + 1))
 );
 CREATE INDEX event_time_axis_span ON event_time USING gist (time_axis, time_span);
 
@@ -352,7 +356,7 @@ CREATE TABLE event_entity (                    -- многие-ко-многим
 CREATE INDEX event_entity_entity_idx ON event_entity (entity_id, event_id);
 ```
 
-- **Время.** У события всегда есть время хотя бы на одной шкале. Мгновенное событие: `{"axis": "game_day", "at": 300}` (`instant = true`, `[300, 301)`); длящееся: `{"axis": "game_day", "from": 299, "to": 301}` (границы опциональны). Маркер `instant` отличает «случилось в момент 300» от «длилось весь день 300». Для `instant = true` БД проверяет CHECK в `event_time`: `(NOT instant) OR (lower(time_span) IS NOT NULL AND upper(time_span) = lower(time_span) + 1)`.
+- **Время.** У события всегда есть время хотя бы на одной шкале. Мгновенное событие: `{"axis": "game_day", "at": 300}` (`instant = true`, `[300, 301)`); длящееся: `{"axis": "game_day", "from": 299, "to": 301}` (границы опциональны). Маркер `instant` отличает «случилось в момент 300» от «длилось весь день 300». Для `instant = true` БД проверяет CHECK в `event_time`: `(NOT instant) OR (lower(time_span) IS NOT NULL AND upper(time_span) IS NOT NULL AND upper(time_span) = lower(time_span) + 1)`; открытый справа интервал для мгновенного события отклоняется (без `upper(...) IS NOT NULL` выражение давало бы NULL и CHECK проходил бы). Также `CHECK (NOT isempty(time_span))`.
 - **Ключевые слова** пишет вызывающая сторона; система нормализует регистр. Словаря и статистики нет. Поиск: `keywords && ...` (`any`) или `keywords @> ...` (`all`) через GIN.
 - **Текстовый поиск** по `summary` и `details` — подстрока через триграммный индекс (без оценок сходства).
 - **Роли** участников — свободный нормализованный текст; `list_event_roles` возвращает уже использованные.

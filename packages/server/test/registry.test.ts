@@ -239,4 +239,64 @@ describe('plugin registry', () => {
       expect(() => reg.getAxis('nope')).toThrow(code('unknown_axis'));
     });
   });
+
+  describe('malformed setup() results degrade the plugin', () => {
+    const goodAxis = axis('x');
+    const goodSource = {
+      name: 'src', description: 'd', payloadSchema: { type: 'object' },
+      ingest: (payload: unknown) => ({ payload }), planRetention: () => [],
+    };
+    const bads: Record<string, () => unknown> = {
+      'axis without description': () => ({ timeAxes: [{ ...goodAxis, description: undefined }] }),
+      'axis with empty description': () => ({ timeAxes: [{ ...goodAxis, description: '' }] }),
+      'axis without example': () => ({ timeAxes: [{ ...goodAxis, example: undefined }] }),
+      'axis without name': () => ({ timeAxes: [{ ...goodAxis, name: '' }] }),
+      'axis with non-object valueSchema': () => ({ timeAxes: [{ ...goodAxis, valueSchema: 'integer' }] }),
+      'axis without encode': () => ({ timeAxes: [{ ...goodAxis, encode: undefined }] }),
+      'axis without decode': () => ({ timeAxes: [{ ...goodAxis, decode: undefined }] }),
+      'axis null entry': () => ({ timeAxes: [null] }),
+      'timeAxes not an array': () => ({ timeAxes: 5 }),
+      'evidenceSources not an array': () => ({ evidenceSources: {} }),
+      'source without description': () => ({ evidenceSources: [{ ...goodSource, description: undefined }] }),
+      'source with bad payloadSchema': () => ({ evidenceSources: [{ ...goodSource, payloadSchema: null }] }),
+      'source without ingest': () => ({ evidenceSources: [{ ...goodSource, ingest: undefined }] }),
+      'source without planRetention': () => ({ evidenceSources: [{ ...goodSource, planRetention: undefined }] }),
+      'async setup (Promise)': () => Promise.resolve({ timeAxes: [goodAxis] }),
+      'array result': () => [],
+      'string result': () => 'nope',
+    };
+
+    for (const [label, mk] of Object.entries(bads)) {
+      it(`${label}: non-core degrades, good plugin still loads`, async () => {
+        await withDb(async (pool) => {
+          await insertPlugin(pool, 'good');
+          await insertPlugin(pool, 'bad');
+          const bad = plug('bad', [], { setup: mk as never });
+          const logger = { warn: vi.fn(), error: vi.fn() };
+          const reg = await loadPlugins(pool, {
+            importer: importerOf({ good: plug('good', ['good_axis']), bad }),
+            logger,
+          });
+          expect(reg.status()).toEqual([
+            { name: 'good', ok: true },
+            { name: 'bad', ok: false, error: expect.stringContaining('invalid_plugin') },
+          ]);
+          expect(logger.error).toHaveBeenCalled();
+          expect(reg.getAxis('good_axis').def.name).toBe('good_axis');
+          const { rows } = await pool.query(`SELECT name FROM time_axis ORDER BY name`);
+          expect(rows).toEqual([{ name: 'good_axis' }]);
+        });
+      });
+
+      it(`${label}: aborts for remora-core`, async () => {
+        await withDb(async (pool) => {
+          await insertPlugin(pool, 'remora-core');
+          const bad = plug('remora-core', [], { setup: mk as never });
+          await expect(
+            loadPlugins(pool, { importer: importerOf({ 'remora-core': bad }) }),
+          ).rejects.toMatchObject({ code: 'invalid_plugin' });
+        });
+      });
+    }
+  });
 });

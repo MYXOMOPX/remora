@@ -58,6 +58,46 @@ function asPluginDef(raw: unknown, spec: string): PluginDef {
   return d as PluginDef;
 }
 
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === 'object' && v !== null && !Array.isArray(v);
+}
+
+function validateSetupResult(raw: unknown, plugin: string): ReturnType<PluginDef['setup']> {
+  const bad = (reason: string) =>
+    new RemoraError('invalid_plugin', `plugin ${plugin}: setup() result is malformed: ${reason}`);
+  if (raw === null || raw === undefined) return {};
+  if (!isObject(raw)) throw bad('expected a plain object');
+  if (typeof (raw as { then?: unknown }).then === 'function') throw bad('setup() must be synchronous, got a thenable');
+  const nonEmpty = (v: unknown) => typeof v === 'string' && v !== '';
+  const { timeAxes, evidenceSources } = raw as { timeAxes?: unknown; evidenceSources?: unknown };
+  if (timeAxes !== undefined) {
+    if (!Array.isArray(timeAxes)) throw bad('timeAxes must be an array');
+    timeAxes.forEach((a: unknown, i) => {
+      const at = `timeAxes[${i}]`;
+      if (!isObject(a)) throw bad(`${at} must be an object`);
+      if (!nonEmpty(a.name)) throw bad(`${at}.name must be a non-empty string`);
+      if (!nonEmpty(a.description)) throw bad(`${at}.description must be a non-empty string`);
+      if (!isObject(a.valueSchema)) throw bad(`${at}.valueSchema must be an object`);
+      if (a.example === undefined) throw bad(`${at}.example must be defined`);
+      if (typeof a.encode !== 'function') throw bad(`${at}.encode must be a function`);
+      if (typeof a.decode !== 'function') throw bad(`${at}.decode must be a function`);
+    });
+  }
+  if (evidenceSources !== undefined) {
+    if (!Array.isArray(evidenceSources)) throw bad('evidenceSources must be an array');
+    evidenceSources.forEach((s: unknown, i) => {
+      const at = `evidenceSources[${i}]`;
+      if (!isObject(s)) throw bad(`${at} must be an object`);
+      if (!nonEmpty(s.name)) throw bad(`${at}.name must be a non-empty string`);
+      if (!nonEmpty(s.description)) throw bad(`${at}.description must be a non-empty string`);
+      if (!isObject(s.payloadSchema)) throw bad(`${at}.payloadSchema must be an object`);
+      if (typeof s.ingest !== 'function') throw bad(`${at}.ingest must be a function`);
+      if (typeof s.planRetention !== 'function') throw bad(`${at}.planRetention must be a function`);
+    });
+  }
+  return raw as ReturnType<PluginDef['setup']>;
+}
+
 export async function addPlugin(
   db: Queryable,
   args: { package: string },
@@ -114,7 +154,7 @@ export async function loadPlugins(
         throw new RemoraError('invalid_plugin', `cannot load package ${p.package}: ${errMsg(e)}`);
       }
       checkConfig(def, p.config, `stored config of ${p.name}`);
-      setupResult = def.setup(p.config) ?? {};
+      setupResult = validateSetupResult(def.setup(p.config), p.name);
     } catch (e) {
       if (p.name === CORE_PLUGIN_NAME) {
         throw new RemoraError('invalid_plugin', `core plugin ${CORE_PLUGIN_NAME} failed to load: ${errMsg(e)}`);

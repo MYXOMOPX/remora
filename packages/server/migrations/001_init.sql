@@ -70,6 +70,7 @@ CREATE TABLE property_version (
   retracted_at          timestamptz,
   retracted_evidence_id bigint REFERENCES evidence_log(id),
   CHECK ((time_axis IS NULL) = (time_span IS NULL)),
+  CHECK (NOT isempty(time_span)),
   FOREIGN KEY (property_type_id, single_valued)
     REFERENCES property_type (id, single_valued),
   EXCLUDE USING gist (
@@ -103,7 +104,8 @@ CREATE TABLE relation (
   recorded_at      timestamptz NOT NULL DEFAULT now(),
   retracted_at          timestamptz,
   retracted_evidence_id bigint REFERENCES evidence_log(id),
-  CHECK ((time_axis IS NULL) = (time_span IS NULL))
+  CHECK ((time_axis IS NULL) = (time_span IS NULL)),
+  CHECK (NOT isempty(time_span))
 );
 CREATE INDEX relation_src_idx ON relation (src, relation_type_id, time_axis);
 CREATE INDEX relation_dst_idx ON relation (dst, relation_type_id, time_axis);
@@ -129,7 +131,8 @@ CREATE TABLE event_time (
   time_span int8range NOT NULL,
   instant   boolean   NOT NULL,
   PRIMARY KEY (event_id, time_axis),
-  CHECK ((NOT instant) OR (lower(time_span) IS NOT NULL AND upper(time_span) = lower(time_span) + 1))
+  CHECK (NOT isempty(time_span)),
+  CHECK ((NOT instant) OR (lower(time_span) IS NOT NULL AND upper(time_span) IS NOT NULL AND upper(time_span) = lower(time_span) + 1))
 );
 CREATE INDEX event_time_axis_span ON event_time USING gist (time_axis, time_span);
 

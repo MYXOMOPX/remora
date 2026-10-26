@@ -32,6 +32,16 @@ describe('normalizeName', () => {
     ['a__b', 'a_b'],
   ])('normalizeName(%j) = %j', (raw, want) => expect(normalizeName(raw)).toBe(want));
 
+  it('NFC and NFD forms normalize identically and keep marks', () => {
+    const nfc = 'Любимый цвет'.normalize('NFC');
+    const nfd = 'Любимый цвет'.normalize('NFD');
+    expect(nfd).not.toBe(nfc);
+    expect(normalizeName(nfd)).toBe('любимый_цвет');
+    expect(normalizeName(nfc)).toBe('любимый_цвет');
+    expect(normalizeName('Ёж'.normalize('NFD'))).toBe('ёж');
+    expect(normalizeName('Q̇ x')).toBe('q̇_x');
+  });
+
   it('rejects names that become empty', () => {
     for (const raw of ['', '   ', '!!!']) {
       expect(() => normalizeName(raw)).toThrow(expect.objectContaining({ code: 'invalid_name' }));
