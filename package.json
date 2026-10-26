@@ -7,7 +7,7 @@
   ],
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc -p packages/sdk --noEmit"
+    "typecheck": "tsc -p packages/sdk --noEmit && tsc -p packages/server --noEmit"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
