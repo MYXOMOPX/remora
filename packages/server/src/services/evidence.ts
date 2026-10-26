@@ -18,6 +18,10 @@ export interface EvidenceSourceRow {
   payloadSchema: unknown;
 }
 
+function isThenable(x: unknown): x is Promise<unknown> {
+  return typeof x === 'object' && x !== null && typeof (x as { then?: unknown }).then === 'function';
+}
+
 /** R16: validate against the source's payload schema, run the plugin's ingest, store the result. */
 export async function addEvidence(
   db: Queryable,
@@ -45,19 +49,31 @@ export async function addEvidence(
       reason: e instanceof Error ? e.message : String(e),
     });
   }
-  if (typeof out !== 'object' || out === null || out.payload === undefined) {
-    throw new RemoraError('invalid_plugin', `ingest of source ${a.source} returned no payload`, {
-      source: a.source,
-    });
+  const badPlugin = (why: string): RemoraError =>
+    new RemoraError('invalid_plugin', `ingest of source ${a.source} ${why}`, { source: a.source });
+  if (isThenable(out)) {
+    out.catch(() => undefined);
+    throw badPlugin('must be synchronous');
   }
+  if (typeof out !== 'object' || out === null || out.payload === undefined) {
+    throw badPlugin('returned no payload');
+  }
+  const json = (v: unknown): string | null => {
+    let j: string | undefined;
+    try {
+      j = JSON.stringify(v);
+    } catch {
+      throw badPlugin('returned a value that is not JSON-serializable');
+    }
+    if (j === undefined) throw badPlugin('returned a value that is not JSON-serializable');
+    return j;
+  };
+  const payloadJson = json(out.payload);
+  const retentionJson = out.retentionState === undefined ? null : json(out.retentionState);
   const r = await db.query<{ id: string }>(
     `INSERT INTO evidence_log (source_id, payload, retention_state)
      VALUES ($1, $2::jsonb, $3::jsonb) RETURNING id`,
-    [
-      info.id,
-      JSON.stringify(out.payload),
-      out.retentionState === undefined ? null : JSON.stringify(out.retentionState),
-    ],
+    [info.id, payloadJson, retentionJson],
   );
   return { id: BigInt(r.rows[0]!.id) };
 }

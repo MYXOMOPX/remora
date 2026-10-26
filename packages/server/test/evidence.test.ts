@@ -25,7 +25,18 @@ const passthru = fakeSource('passthru', {
 });
 const badPlugin = fakeSource('badplug', { ingest: () => ({}) as { payload: unknown } });
 
-const ALL = ['chat', 'raw', 'boom', 'passthru', 'badplug', 'down'];
+const circ: Record<string, unknown> = {};
+circ.self = circ;
+const odd: Record<string, ReturnType<typeof fakeSource>> = {
+  big: fakeSource('big', { ingest: () => ({ payload: 1n }) }),
+  fn: fakeSource('fn', { ingest: () => ({ payload: () => 1 }) }),
+  circ: fakeSource('circ', { ingest: () => ({ payload: circ }) }),
+  retbig: fakeSource('retbig', { ingest: () => ({ payload: {}, retentionState: 1n }) }),
+  asyncy: fakeSource('asyncy', { ingest: (async () => ({ payload: {} })) as never }),
+  asyncrej: fakeSource('asyncrej', { ingest: (async () => Promise.reject(new Error('r'))) as never }),
+};
+
+const ALL = ['chat', 'raw', 'boom', 'passthru', 'badplug', ...Object.keys(odd), 'down'];
 
 interface Ctx {
   pool: pg.Pool;
@@ -39,7 +50,7 @@ async function withDb(fn: (c: Ctx) => Promise<void>): Promise<void> {
   try {
     await runMigrations(pool);
     const seeded = await seedBasics(pool);
-    const reg = await seedAxes(pool, seeded, [chat, fakeSource('raw'), boom, passthru, badPlugin], ['down']);
+    const reg = await seedAxes(pool, seeded, [chat, fakeSource('raw'), boom, passthru, badPlugin, ...Object.values(odd)], ['down']);
     await fn({
       pool,
       reg,
@@ -102,6 +113,17 @@ describe('addEvidence', () => {
     });
   });
 
+  it('non-JSON or async ingest output -> invalid_plugin and nothing stored', async () => {
+    await withDb(async ({ pool, reg }) => {
+      for (const source of Object.keys(odd)) {
+        const e = await failure(addEvidence(pool, reg, { source, payload: { text: 'a' } }));
+        expect(e.code, source).toBe('invalid_plugin');
+        expect(e.details, source).toMatchObject({ source });
+      }
+      expect((await pool.query('SELECT 1 FROM evidence_log')).rows).toHaveLength(0);
+    });
+  });
+
   it('getEvidence and listEvidenceSources', async () => {
     await withDb(async ({ pool, reg }) => {
       const { id } = await addEvidence(pool, reg, { source: 'chat', payload: { text: 'hi' } });
@@ -135,6 +157,17 @@ describe('apply add_evidence', () => {
       expect(Number(rel.rows[0].evidence_id)).toBe(e.id);
       const r2 = await run({ op: 'add_property', entity: 'bob', property: 'nickname', value: 'B2', evidence: e.id });
       expect(r2.ok).toBe(true);
+    });
+  });
+
+  it('a failed batch rolls back the evidence insert', async () => {
+    await withDb(async ({ pool, run }) => {
+      const r = await run(
+        { op: 'add_evidence', source: 'chat', payload: { text: 'a' } },
+        { op: 'add_property', entity: 'nobody', property: 'nickname', value: 'x' },
+      );
+      expect(r).toMatchObject({ ok: false, error: { op_index: 1 } });
+      expect((await pool.query('SELECT 1 FROM evidence_log')).rows).toHaveLength(0);
     });
   });
 
