@@ -19,6 +19,7 @@ import {
   type PropertyRow,
   type RelationRow,
 } from '../services/facts-read.js';
+import { neighbors, type NeighborRow } from '../services/neighbors.js';
 import { parseWhen } from '../services/time.js';
 import { isObj, optBool, optInt, optStr, optStrArr, str, type Obj } from './args.js';
 import { failure, mapPgError, rollback, type ApiError } from './apply.js';
@@ -67,6 +68,21 @@ const propertyType = (t: PropertyType): Obj => ({
   value_type: t.valueType,
   single_valued: t.singleValued,
 });
+
+function neighborRow(r: NeighborRow): Obj {
+  const out: Obj = { entity: r.entity, depth: r.depth };
+  if (r.via) {
+    out.via = {
+      relation: r.via.relation,
+      from: r.via.from,
+      relation_id: Number(r.via.relationId),
+      time: r.via.time,
+    };
+  }
+  if (r.viaCount !== undefined) out.via_count = r.viaCount;
+  if (r.properties !== undefined) out.properties = r.properties;
+  return out;
+}
 
 function invalid(message: string, field: string): RemoraError {
   return new RemoraError('invalid_param', message, { field });
@@ -126,6 +142,40 @@ const HANDLERS: Record<string, Handler> = {
     });
     return { rows: r.rows.map(relationRow), total: r.total, truncated: r.truncated };
   },
+  async neighbors({ db, registry }, o) {
+    const entity = str(o, 'entity');
+    const relationTypes = optStrArr(o, 'relation_types');
+    const direction = optStr(o, 'direction');
+    if (direction !== undefined && direction !== 'out' && direction !== 'in' && direction !== 'both') {
+      throw invalid('direction must be out, in or both', 'direction');
+    }
+    const depth = optInt(o, 'depth');
+    const when = parseWhen(registry, o.when);
+    const include = optStrArr(o, 'include');
+    let orderBy: { property: string; dir?: 'asc' | 'desc' } | undefined;
+    if (o.order_by !== undefined) {
+      if (!isObj(o.order_by)) throw invalid('order_by must be an object {property, dir?}', 'order_by');
+      const dir = optStr(o.order_by, 'dir');
+      if (dir !== undefined && dir !== 'asc' && dir !== 'desc') {
+        throw invalid('order_by.dir must be asc or desc', 'order_by');
+      }
+      orderBy = { property: str(o.order_by, 'property'), ...(dir !== undefined ? { dir } : {}) };
+    }
+    const limit = optInt(o, 'limit');
+    const paths = optBool(o, 'paths');
+    const r = await neighbors(db, registry, {
+      entity,
+      ...(relationTypes !== undefined ? { relationTypes } : {}),
+      ...(direction !== undefined ? { direction } : {}),
+      ...(depth !== undefined ? { depth } : {}),
+      ...(when !== undefined ? { when } : {}),
+      ...(include !== undefined ? { include } : {}),
+      ...(orderBy !== undefined ? { orderBy } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+      ...(paths !== undefined ? { paths } : {}),
+    });
+    return { rows: r.rows.map(neighborRow), total: r.total, truncated: r.truncated };
+  },
   async list_relation_types({ db }) {
     return { rows: (await listRelationTypes(db)).map(relationType) };
   },
@@ -171,7 +221,7 @@ export async function query(pool: pg.Pool, registry: PluginRegistry, request: un
       try {
         if (!isObj(op)) throw new RemoraError('invalid_param', 'op must be an object');
         const name = op.op;
-        // neighbors, event and evidence ops arrive in plan 3: unknown here
+        // event and evidence ops arrive in plan 3: unknown here
         const handler = typeof name === 'string' && Object.hasOwn(HANDLERS, name) ? HANDLERS[name] : undefined;
         if (!handler) {
           throw new RemoraError('invalid_param', `unknown op: ${String(name)}`, { op: name });

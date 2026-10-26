@@ -207,7 +207,6 @@ describe('query', () => {
   it('unknown and deferred ops are invalid_param; failing second op reports op_index 1', async () => {
     await withDb(async ({ q }) => {
       const names = [
-        'neighbors',
         'get_event',
         'search_events',
         'entity_events',
