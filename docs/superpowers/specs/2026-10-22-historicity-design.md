@@ -1,27 +1,28 @@
 # Историчность фактов: дизайн v1
 
-Дата: 2026-10-22
+Дата: 2026-10-25 (первая версия 2026-10-22)
 Статус: черновик, ждёт ревью
 
 ## 1. Цель
 
-Хранить факты о сущностях (свойства и связи) с историей изменений на нескольких шкалах времени одновременно: реальное время, игровые дни, сюжетные главы и т.д. Факт может быть валиден на одной шкале, на нескольких или ни на одной.
+Хранить факты о сущностях (свойства и связи) с историей изменений на нескольких шкалах времени одновременно: реальное время, игровые дни, сюжетные главы и т.д. Факт может быть валиден на одной шкале, на нескольких или быть безвременным.
 
 Требования:
 - ответ на вопрос «какое значение было / какие связи были на момент T по шкале X»;
-- обходы графа на 5–6 шагов с фильтром по времени на каждом шаге;
-- запрещённые состояния (два значения одного одноместного свойства одновременно) не записываются;
-- сырые данные и evidence сохраняются отдельно от фактов;
-- новая шкала времени и новый предикат добавляются без миграций схемы.
+- обходы по связям на 5–6 шагов с фильтром по времени на каждом шаге;
+- сырые данные и evidence хранятся отдельно от фактов;
+- новая шкала времени и новый тип свойства или связи добавляются без миграций схемы;
+- один запрос может содержать много операций, выполняемых атомарно.
 
-Вне рамок v1: свободные (неструктурированные) данные сверх `evidence_log`, дедупликация предикатов силами системы, LLM внутри системы.
+Вне рамок v1: связи между событиями; автоматическая политика хранения evidence по расписанию; дедупликация типов силами системы; LLM внутри системы; многопользовательскость (одна база).
 
-## 2. Компоненты
+## 2. Архитектура
 
-Одна база PostgreSQL с расширениями `age` (граф) и `btree_gist` (EXCLUDE по скалярным типам). Одна транзакция на запись, без синхронизации двух хранилищ.
+Микросервис в Docker-контейнере поверх одной базы PostgreSQL с расширениями `btree_gist` (EXCLUDE по скалярным типам) и `pg_trgm` (триграммные индексы для текстового поиска; оценок сходства и поиска дублей не используется). Транспорт: HTTP и MCP; операции API становятся инструментами MCP один в один.
 
-- **Граф `remora`** (AGE): сущности и связи, обходы.
-- **Таблицы PostgreSQL**: словари, свойства, журнал evidence.
+Авторизация в v1: секретный URL (`secret_url`) на сервис; один URL — одна база, ролей нет.
+
+Граф как отдельное хранилище не используется. Связи — обычная таблица `relation`, обходы — цепочка JOIN или рекурсивный CTE (обоснование — раздел 13).
 
 ## 3. Сущности
 
@@ -30,56 +31,66 @@ CREATE TABLE entity (
   entity_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   key       text NOT NULL UNIQUE          -- внешний идентификатор
 );
+CREATE INDEX entity_key_trgm ON entity USING gin (key gin_trgm_ops);   -- для find_entities
 ```
 
-Все внутренние ссылки — `bigint`. Текст используется только в `key`.
-
-В графе сущность — вершина метки `Entity` со свойством `entity_id`.
+Все внутренние ссылки — `bigint`; текст используется только в `key`. Сущность создаётся явной операцией `create_entity`; использование неизвестного `key` в других операциях — ошибка.
 
 ## 4. Словари
-
-Два словаря, потому что свойство и связь — разные сущности:
 
 ```sql
 CREATE TABLE relation_type (
   id          smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   name        text NOT NULL UNIQUE,
   description text NOT NULL,              -- для LLM: когда использовать
-  direction   text NOT NULL CHECK (direction IN ('directed', 'symmetric')),
-  created_by  text NOT NULL               -- 'plugin' | 'llm'
+  directed    boolean NOT NULL            -- true: направленная, false: симметричная
 );
 
 CREATE TABLE property_type (
-  id          smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  name        text NOT NULL UNIQUE,
-  description text NOT NULL,
-  value_type  text NOT NULL CHECK (value_type IN ('number', 'text', 'date', 'bool', 'json')),
-  created_by  text NOT NULL
+  id            smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name          text NOT NULL UNIQUE,
+  description   text NOT NULL,
+  value_type    text NOT NULL CHECK (value_type IN ('number', 'text', 'date', 'bool', 'json')),
+  single_valued boolean NOT NULL,         -- в один момент одно значение
+  UNIQUE (id, single_valued)              -- цель составного FK (раздел 6)
 );
 ```
 
-Ограничение: имена не должны совпадать между словарями. Проверяется на уровне API создания (см. раздел 9).
+Имена не должны совпадать между словарями; проверяется API создания (раздел 9). `single_valued` после создания типа не меняется (раздел 6).
 
 ## 5. Шкалы времени
 
 ```sql
 CREATE TABLE time_axis (
-  id     smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  id     smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,   -- начинается с 1
   name   text NOT NULL UNIQUE,            -- 'real', 'game_day', 'story'
-  plugin text NOT NULL                    -- владелец правила кодирования
+  plugin text NOT NULL,                   -- владелец правила кодирования
+  description  text  NOT NULL,            -- для LLM: что измеряет шкала и как писать значение
+  value_schema jsonb NOT NULL,            -- JSON Schema входного значения, например объект {tome, chapter}
+  example      jsonb NOT NULL             -- пример значения, который понимает плагин
 );
 ```
 
-Правило кодирования (encoding) — в манифесте плагина, не в БД. Требование к нему: сохранять порядок, то есть `A < B` на шкале ⇔ `encode(A) < encode(B)`. Encoding не меняется после записи данных; изменение правила — это новая шкала с новым `id`.
+`description`, `value_schema` и `example` плагин передаёт при регистрации шкалы; их возвращает `list_time_axes`. Пример для `story`: `value_schema = {"type":"object","properties":{"tome":{"type":"integer"},"chapter":{"type":"integer"},"scene":{"type":"integer"}},"required":["tome"]}`, `example = {"tome": 10, "chapter": 5}`. API проверяет входное значение времени по `value_schema` (ошибка `invalid_time`) и передаёт плагину, который кодирует его в число.
+
+Правило кодирования (encoding) — в манифесте плагина, не в БД. Оно сохраняет порядок: `A < B` на шкале ⇔ `encode(A) < encode(B)`. Encoding не меняется после записи данных; изменение правила — новая шкала с новым `id`. На входе и выходе API время передаётся в единицах шкалы; кодирование в `int8` делает плагин.
 
 Примеры:
 - `real`: секунды от epoch;
 - `game_day`: номер дня как есть;
-- `story`: `tome*10^6 + chapter*10^3 + scene`, разряды с запасом и проверкой при записи.
+- `story`: `tome*10^6 + chapter*10^3 + scene`; значения компонентов проверяются при записи (при множителе 10^3 тройка `(2, 1000, 0)` дала бы `3000000`, как `(3, 0, 0)`, поэтому верхние границы разрядов проверяются).
 
-Понятие **`time_span`** — пара `(time_axis, интервал)`. В таблицах это два столбца: `time_axis` и `time_span`.
+**Временная привязка факта** — пара `(time_axis, time_span)`:
+- `time_span` — `int8range` с полуинтервалом `[from, to)`; обе границы опциональны (`NULL` = без ограничения);
+- **безвременный факт**: оба поля `NULL`; такой факт считается актуальным при любом запросе времени.
 
-Открытые границы: `int8range` поддерживает бесконечные границы. Открытый конец хранится как `NULL` (`[a, )`), открытое начало — как `(, b]`. «Сейчас» — параметр запроса, в данных не хранится.
+Факт актуален на момент `t` шкалы `X`, если
+
+```
+time_axis IS NULL OR (time_axis = X AND from <= t AND t < to)   -- границы NULL означают «нет ограничения»
+```
+
+Значение, валидное на двух шкалах, — две строки (без общего идентификатора для свойств; `relation_id` для связей — раздел 7). «Сейчас» в данных не хранится: у каждой шкалы оно своё, его задаёт вызывающая сторона параметром `at`. Режима «только открытые факты» нет.
 
 ## 6. Свойства
 
@@ -87,103 +98,379 @@ CREATE TABLE time_axis (
 CREATE TABLE property_version (
   id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   entity_id        bigint    NOT NULL REFERENCES entity(entity_id),
-  property_type_id smallint  NOT NULL REFERENCES property_type(id),
-  time_axis        smallint  NOT NULL REFERENCES time_axis(id),
-  time_span        int8range NOT NULL,
+  property_type_id smallint  NOT NULL,
+  single_valued    boolean   NOT NULL,     -- копия флага из property_type, заполняется триггером
+  time_axis        smallint  REFERENCES time_axis(id),
+  time_span        int8range,
   value            jsonb     NOT NULL,
-  evidence_id      bigint,
+  evidence_id      bigint    REFERENCES evidence_log(id),
   recorded_at      timestamptz NOT NULL DEFAULT now(),
-  EXCLUDE USING gist (entity_id WITH =, property_type_id WITH =,
-                      time_axis WITH =, time_span WITH &&)
+  retracted_at          timestamptz,     -- отозванная запись (раздел 6, «Отзыв»)
+  retracted_evidence_id bigint REFERENCES evidence_log(id),
+  CHECK ((time_axis IS NULL) = (time_span IS NULL)),
+  FOREIGN KEY (property_type_id, single_valued)
+    REFERENCES property_type (id, single_valued),
+  EXCLUDE USING gist (
+    entity_id WITH =,
+    property_type_id WITH =,
+    (COALESCE(time_axis, 0)) WITH =,
+    (COALESCE(time_span, '(,)'::int8range)) WITH &&
+  ) WHERE (single_valued AND retracted_at IS NULL)
 );
+
+CREATE FUNCTION property_version_fill() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  SELECT single_valued INTO NEW.single_valued FROM property_type WHERE id = NEW.property_type_id;
+  RETURN NEW;
+END $$;
+CREATE TRIGGER property_version_fill_t BEFORE INSERT ON property_version
+  FOR EACH ROW EXECUTE FUNCTION property_version_fill();
+
+-- текстовый поиск по значениям-строкам
+CREATE INDEX property_version_text_trgm ON property_version
+  USING gin ((value #>> '{}') gin_trgm_ops) WHERE jsonb_typeof(value) = 'string';
 ```
 
-Свойство — это значение, которое в один момент может быть только одно. EXCLUDE гарантирует это на уровне базы.
+- Одна строка — одно значение на одной шкале (или безвременное).
+- Для **многоместных** свойств (`single_valued = false`) в БД на одном промежутке может быть несколько значений.
+- Для **одноместных** EXCLUDE запрещает пересечение интервалов. Копия `single_valued` в строке заполняется триггером из справочника, составной FK не даёт ей разойтись; пока у типа есть строки, флаг в словаре изменить нельзя.
+- Проверено в спайке на этой схеме (PostgreSQL 18.6): пересечение на одной шкале отклоняется; тот же интервал на другой шкале проходит; два безвременных значения одноместного свойства отклоняются; многоместное свойство принимает два открытых значения; шкала без интервала отклоняется CHECK; «закрыть старую строку и вставить новую» в одной транзакции проходит; изменение флага при существующих строках отклоняется.
+- Безвременное и временное значения одноместного свойства EXCLUDE не различает (разные ключи `COALESCE`), поэтому правило задаёт API: для одноместного свойства нельзя иметь одновременно безвременное и временные (неотозванные) значения; нарушение — ошибка `timeless_conflict`.
+- Строки не удаляются, ошибочные записи отзываются (см. «Отзыв»). Условие `retracted_at IS NULL` в EXCLUDE в спайке не проверялось (раздел 14).
 
-Закрытие интервала: старая строка получает верхнюю границу, новая строка вставляется. Строки не удаляются.
+### Операции записи свойств
 
-## 7. Связи (граф)
+Каждая выполняется в рамках общего пакета (раздел 10). Примеры на шкале `game_day`.
 
-Метка рёбер `RELATION`. Одно ребро — одна шкала времени. Связь на нескольких шкалах хранится несколькими рёбрами с одним `fact_id`.
+Одноместное `job_title`:
 
-Свойства ребра:
-- `relation_type_id` — ссылка на `relation_type`;
-- `fact_id` — `bigint` из последовательности, идентификатор связи вне графа;
-- `evidence_id` — ссылка на `evidence_log`;
-- `time_axis` — `smallint`;
-- `from`, `to` — границы интервала как числа; отсутствие свойства означает открытую границу.
+| Вызов | Строки после |
+|---|---|
+| `replace_property(Bob, job_title, game_day, at=292, 'Junior')` | `[292,)` Junior |
+| `replace_property(..., at=300, 'Senior')` | `[292,300)` Junior; `[300,)` Senior |
+| `end_property(Bob, job_title, game_day, at=310)` | `[292,300)` Junior; `[300,310)` Senior |
 
-Пример: `Bob --works_at--> Google` на шкале `game_day` с днями 292–306:
+Многоместное `nickname`:
 
-```
-(Bob)-[RELATION {relation_type_id:1, fact_id:10, evidence_id:5,
-                 time_axis:2, from:292, to:306}]->(Google)
-```
+| Вызов | Строки после |
+|---|---|
+| `add_property(Bob, nickname, game_day, from=292, 'Bobby')` | `[292,)` Bobby |
+| `add_property(Bob, nickname, game_day, from=295, 'Rob')` | `[292,)` Bobby; `[295,)` Rob |
 
-Связи не имеют EXCLUDE: две связи одного типа одновременно допустимы.
+Правила:
+- `replace_property` закрывает **все** открытые строки свойства на шкале (`to = at`) и вставляет новую (`from = at`); закрыть можно только моментом `at ≥ from` открытой строки;
+- `add_property` на одноместном свойстве вставляет строку и упирается в EXCLUDE при пересечении; штатный путь замены — `replace_property`;
+- `end_property` закрывает открытые строки и новой не создаёт;
+- `replace_property` без `time` работает с безвременным значением: отзывает текущее безвременное значение и вставляет новое (истории интервалов у такого значения нет);
+- значение проверяется на соответствие `value_type`.
 
-Направление: `directed` хранится как есть; `symmetric` хранится одним ребром, и при чтении направление не учитывается.
+### Отзыв
 
-## 8. Правило выбора: свойство или связь
+Строки не удаляются. Ошибочно записанный факт отзывается: в строке проставляется `retracted_at` (и, если задан, `retracted_evidence_id`). Отозванные строки не участвуют в EXCLUDE и по умолчанию не попадают в чтение; `property_history` и `relation_history` возвращают их при `include_retracted: true`. Исправление = отзыв неверной строки + вставка верной в одном пакете. Отозвать можно только по `id` строки (id возвращают операции чтения и записи).
 
-- Если у сущности в один момент может быть больше одного значения — это **связь** (`relation_type`). Пример: `Bob --favorite_color--> Blue` и `Bob --favorite_color--> Green`. Цвета — сущности.
-- Если в один момент одно значение — это **свойство** (`property_type`). Пример: `Carl.height = 186`.
-
-Правило задаёт тот, кто моделирует предикат, а не база. Словарь выбирается при создании.
-
-## 9. Создание типов (для LLM и плагинов)
-
-Система не содержит LLM и не решает, являются ли два имени синонимами.
-
-1. **Нормализация имени** при записи: нижний регистр, пробелы в `_`, без спецсимволов. Точная проверка.
-2. **Поиск кандидатов**: `find_relation_types(query)` и `find_property_types(query)` через `pg_trgm` (триграммное сходство). Возвращают список с оценкой; решение за вызывающей стороной.
-3. **Создание с подтверждением**: `create_relation_type(...)` / `create_property_type(...)` без `confirm_new = true` возвращают похожих кандидатов и ничего не создают. С `confirm_new = true` создают тип.
-4. **Проверка кросс-словарей**: имя не должно совпадать с именем в другом словаре.
-
-Описание (`description`) пишет тот, кто создаёт тип. Оно отдаётся LLM вместе со списком типов.
-
-## 10. Операции чтения
-
-Закрытый набор операций с параметрами. Своего языка запросов нет.
-
-Примеры:
-- `property_at(entity, property_type, time_axis, at)` — значение на момент;
-- `property_history(entity, property_type, time_axis)` — история;
-- `neighbors(entity, relation_type, time_axis, at, depth, include, order_by, limit)` — обход на `depth` шагов, фильтр по времени на каждом шаге, подтягивание свойств из `property_version`, сортировка, лимит.
-
-Структура `neighbors` — JSON-объект с типизированными полями. Поля фиксированы. Запрос, не укладывающийся в них, — новая операция или несколько вызовов.
-
-Внутри `neighbors` два шага: обход в AGE, затем присоединение `property_version` на тот же момент.
-
-Cypher генерирует код сервера, LLM его не пишет. Условие на открытую границу в Cypher: `(r.from IS NULL OR r.from <= $at) AND (r.to IS NULL OR r.to >= $at)`.
-
-## 11. Evidence
-
-`evidence_log` — таблица только для добавления:
+## 7. Связи
 
 ```sql
-CREATE TABLE evidence_log (
+CREATE TABLE relation (
+  id               bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  relation_id      bigint NOT NULL,        -- логическая связь; общий для строк по шкалам
+  relation_type_id smallint NOT NULL REFERENCES relation_type(id),
+  src              bigint NOT NULL REFERENCES entity(entity_id),
+  dst              bigint NOT NULL REFERENCES entity(entity_id),
+  time_axis        smallint REFERENCES time_axis(id),
+  time_span        int8range,
+  evidence_id      bigint REFERENCES evidence_log(id),
+  recorded_at      timestamptz NOT NULL DEFAULT now(),
+  retracted_at          timestamptz,
+  retracted_evidence_id bigint REFERENCES evidence_log(id),
+  CHECK ((time_axis IS NULL) = (time_span IS NULL))
+);
+CREATE INDEX relation_src_idx ON relation (src, relation_type_id, time_axis);
+CREATE INDEX relation_dst_idx ON relation (dst, relation_type_id, time_axis);
+```
+
+`relation_id` берётся из последовательности. Одна строка — одна шкала. Связь, валидная на двух шкалах, — две строки с общим `relation_id`. Безвременная связь — одна строка с `NULL` в `time_axis` и `time_span`.
+
+Пример: Боб работает в Google на `game_day` с 292 по 306 и в реальном времени с 2026-10-01 по 2026-10-20:
+
+```
+relation_id=10  Bob → Google  works_at  game_day  [292,306)
+relation_id=10  Bob → Google  works_at  real      [1790812800,1792540800)
+```
+
+- Ограничений уникальности нет: две связи одного типа одновременно допустимы.
+- `directed = false`: строка одна, чтение учитывает обе стороны (`src = x OR dst = x`, для обхода — `UNION ALL` двух направлений).
+- Обратное имя связи не хранится.
+
+Операции:
+- `add_relation` — создаёт строки на указанных шкалах с общим новым `relation_id`; ответ содержит `relation_id`;
+- `end_relation` — закрывает `to` на шкале `axis` в момент `at`. Связь задаётся либо `relation_id`, либо селектором `{type, from, to}` (закрываются все неотозванные открытые связи этого типа между сущностями; если подходящих нет — ошибка `not_found`);
+- `retract_relation` — отзывает все строки связи (или только строку шкалы `axis`); связь задаётся так же, как в `end_relation`. Отзыв строк связи не удаляет их.
+
+Все чтения и `neighbors` исключают отозванные строки; `relation_history` возвращает их при `include_retracted: true`.
+
+## 8. Свойство или связь
+
+- Если в один момент может быть больше одного значения с собственной идентичностью (хобби, любимые цвета) — **связь** к сущности: `Bob --favorite_color--> Blue`, `Bob --favorite_color--> Green`.
+- Если значение скалярное — **свойство**: `Carl.height = 186`; `single_valued` отмечает, что значение одно.
+
+Правило применяет тот, кто создаёт тип.
+
+## 9. Создание типов
+
+Система не содержит LLM, не ищет дубли и не решает, являются ли два имени синонимами. Дедупликация целиком на стороне вызывающего.
+
+1. **Нормализация имени** при записи: нижний регистр, пробелы в `_`, без спецсимволов.
+2. **Поиск**: `find_relation_types(query)` и `find_property_types(query)` — поиск по вхождению слов запроса в имя и описание (`ILIKE`, без оценок сходства); `list_*` — полный список. Кандидатов и оценок система не вычисляет.
+3. **Создание**: `create_relation_type(...)` / `create_property_type(...)` создаёт тип сразу. Ошибка `name_taken`, если нормализованное имя уже есть в любом словаре (кросс-словарная проверка).
+
+## 10. API
+
+Закрытый набор операций с типизированными JSON-параметрами. Языка запросов нет; LLM SQL не пишет.
+
+### 10.1 Запись: `apply`
+
+Один вызов — список операций. Выполняются по порядку в одной транзакции; каждая видит результат предыдущих. Любая ошибка откатывает весь пакет и возвращает индекс операции и типизированную причину. Одиночная операция — пакет из одной.
+
+Локальные имена: операция может объявить `"as": "имя"`, дальше на результат ссылаются как `"$имя"`. Evidence необязателен; один `add_evidence` может стоять под любым числом фактов пакета. `evidence` — это `$имя` либо числовой id существующей записи.
+
+```json
+{"ops": [
+  {"op": "add_evidence", "as": "e1", "source": "chat_message", "payload": {"msg": "..."}},
+  {"op": "create_entity", "key": "carl"},
+  {"op": "replace_property", "entity": "bob", "property": "job_title",
+   "time": {"axis": "game_day", "at": 292}, "value": "Senior", "evidence": "$e1"},
+  {"op": "add_relation", "type": "works_at", "from": "bob", "to": "google",
+   "time": {"axis": "game_day", "from": 292}, "evidence": "$e1"}
+]}
+```
+
+Операции записи:
+
+| Операция | Назначение | Время |
+|---|---|---|
+| `add_evidence` | запись в `evidence_log` через плагин источника (`source`, `payload` по схеме, раздел 12) | — |
+| `add_event`, `update_event`, `retract_event` | события (раздел 11) | `time[]` у `add_event` |
+| `create_entity` | создаёт или возвращает существующую (идемпотентна) | — |
+| `add_property` | значение; многоместные свойства | необязательно: `axis` + `from`/`to`; можно список (по строке на шкалу); без `time` — безвременное |
+| `replace_property` | закрыть открытые и открыть новое | `axis` + `at` обязательны |
+| `end_property` | закрыть открытые | `axis` + `at` обязательны |
+| `add_relation` | связь | как у `add_property` |
+| `end_relation` | закрыть связь по `relation_id` или селектору `{type, from, to}` | `axis` + `at` обязательны |
+| `retract_property` | отозвать ошибочную запись по `id` | — |
+| `retract_relation` | отозвать связь (все шкалы или одну) | — |
+| `create_relation_type`, `create_property_type` | словари | — |
+
+`end_property`, `end_relation`, `retract_*` принимают необязательный `evidence`.
+
+### Форма ответа и ошибки
+
+Успех: `{"ok": true, "results": [ ...результат каждой операции по порядку... ]}`. Результат операции записи содержит созданные или изменённые `id` строк, у `add_relation` — `relation_id`, у операций с `as` — ссылку.
+
+Ошибка (весь пакет откатывается): `{"ok": false, "error": {"op_index": 2, "code": "unknown_entity", "message": "...", "details": {...}}}`.
+
+Коды: `unknown_entity`, `unknown_type`, `unknown_axis`, `unknown_ref`, `value_type_mismatch`, `single_valued_conflict`, `timeless_conflict`, `invalid_time` (с причиной по `value_schema`), `not_found`, `name_taken`, `invalid_payload`, `unknown_source`, `too_many_paths`, `concurrent_update` (повторить пакет).
+
+### Контракт
+
+Сервис публикует JSON Schema для `apply`, `query`, ответов и ошибок (HTTP: `/schema`; MCP: схемы инструментов). Схемы — источник для документации и клиентов.
+
+### 10.2 Чтение: `query`
+
+Список read-операций, результаты возвращаются по порядку. Время задаётся необязательным параметром `when`:
+- `{"axis": "game_day", "at": 300}` — актуальные на момент;
+- `{"axis": "game_day", "during": [290, 310]}` — пересекающие промежуток;
+- опущен — без фильтра по времени: все версии, каждая со своим `time`.
+
+Безвременные факты попадают в ответ при любом `when`.
+
+| Операция | Назначение |
+|---|---|
+| `get_entity(key)` | сущность |
+| `find_entities(query, limit)` | поиск сущностей по вхождению слов запроса в `key` (без оценок сходства) |
+| `property_at(entity, property, when)` | значения (список: у многоместных их несколько), каждое с `id` |
+| `property_history(entity, property, [axis], [include_retracted])` | все версии, с интервалами и `id` |
+| `relation_history(entity, [relation_types], [direction], [when], [include_retracted])` | все версии связей с `relation_id` |
+| `neighbors(...)` | обход |
+| `get_event`, `search_events`, `entity_events`, `list_event_roles` | события (раздел 11) |
+| `list_evidence_sources`, `get_evidence` | evidence (раздел 12) |
+| `list_relation_types`, `list_property_types`, `find_*_types`, `list_time_axes` | словари (шкалы — с `description`, `value_schema`, `example`) |
+
+### 10.3 `neighbors`
+
+Параметры: `entity`, `relation_types[]`, `direction` (`out` | `in` | `both`, для симметричных игнорируется), `depth` (1–6), `when`, `include[]` (свойства для подтягивания), `order_by` (`{property, dir}`), `limit` (по умолчанию 50, максимум 200), `paths` (bool, по умолчанию `false`). Пагинации нет: ответ содержит `total` и `truncated`, при `truncated: true` вызывающий сужает запрос.
+
+Ответ по умолчанию — **строки по сущностям**: каждая достижимая сущность один раз, с минимальной глубиной и ребром, по которому её достигли (`via`), и вложенными свойствами из `include`:
+
+```json
+{"rows": [
+  {"entity": "carl", "depth": 1,
+   "via": {"relation": "friend_of", "from": "bob", "relation_id": 12, "time": {"axis": "game_day", "from": 100}},
+   "properties": {"height": [186]}}
+], "total": 1, "truncated": false}
+```
+
+При `paths: true` возвращаются полные пути (цепочки сущностей и связей с их временем) вместо `via`; путей не больше 10 000, иначе ошибка `too_many_paths` (сузить запрос). Сортировка и `limit` применяются к сущностям. «Самый высокий друг Боба» — один вызов: `depth: 1`, `include: ["height"]`, `order_by: {property: "height", dir: "desc"}`, `limit: 1`.
+
+Внутри (режим по умолчанию): обход по уровням — рекурсивный CTE с `UNION` (дедупликация достигнутых сущностей) и фильтром времени на каждом шаге; несколько параллельных рёбер к одной сущности схлопываются в одну строку (в `via` — одно из них, плюс `via_count`). Затем присоединение `property_version` на тот же момент. Перебор всех путей (`paths: true`) на графе с хабами взрывается (спайк: 977 млн путей и 13 с на 500 стартов при хабе на 500 000 связей против 0,7 с у обхода по уровням), поэтому используется только при явном запросе и только с лимитом. SQL генерирует код сервера.
+
+## 11. События
+
+Наблюдение вроде «видел вчера Боба, он сделал сальтуху при мне» не укладывается в свойства и связи. Для него — отдельная сущность `event`: текст, ключевые слова, время, участники.
+
+```sql
+CREATE TABLE event (
   id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-  source_type text NOT NULL,
-  payload     jsonb NOT NULL,
-  created_at  timestamptz NOT NULL DEFAULT now()
+  summary     text   NOT NULL,                 -- 1–2 фразы, то, что LLM увидит в выдаче
+  details     text,                            -- необязательный подробный текст
+  keywords    text[] NOT NULL DEFAULT '{}',    -- нормализованные (нижний регистр)
+  evidence_id bigint REFERENCES evidence_log(id),
+  recorded_at timestamptz NOT NULL DEFAULT now(),
+  updated_at  timestamptz,                     -- проставляется update_event
+  retracted_at          timestamptz,
+  retracted_evidence_id bigint REFERENCES evidence_log(id)
+);
+CREATE INDEX event_keywords_gin ON event USING gin (keywords);
+CREATE INDEX event_text_trgm ON event
+  USING gin ((summary || ' ' || coalesce(details, '')) gin_trgm_ops);
+
+CREATE TABLE event_time (                      -- когда произошло, по шкалам
+  event_id  bigint    NOT NULL REFERENCES event(id),
+  time_axis smallint  NOT NULL REFERENCES time_axis(id),
+  time_span int8range NOT NULL,
+  instant   boolean   NOT NULL,                -- true: мгновенное событие, time_span = [t, t+1)
+  PRIMARY KEY (event_id, time_axis)
+);
+CREATE INDEX event_time_axis_span ON event_time USING gist (time_axis, time_span);
+
+CREATE TABLE event_entity (                    -- многие-ко-многим
+  event_id  bigint NOT NULL REFERENCES event(id),
+  entity_id bigint NOT NULL REFERENCES entity(entity_id),
+  role      text   NOT NULL DEFAULT 'participant',   -- свободный нормализованный текст
+  PRIMARY KEY (event_id, entity_id, role)
+);
+CREATE INDEX event_entity_entity_idx ON event_entity (entity_id, event_id);
+```
+
+- **Время.** У события всегда есть время хотя бы на одной шкале. Мгновенное событие: `{"axis": "game_day", "at": 300}` (`instant = true`, `[300, 301)`); длящееся: `{"axis": "game_day", "from": 299, "to": 301}` (границы опциональны). Маркер `instant` отличает «случилось в момент 300» от «длилось весь день 300».
+- **Ключевые слова** пишет вызывающая сторона; система нормализует регистр. Словаря и статистики нет. Поиск: `keywords && ...` (`any`) или `keywords @> ...` (`all`) через GIN.
+- **Текстовый поиск** по `summary` и `details` — подстрока через триграммный индекс (без оценок сходства).
+- **Роли** участников — свободный нормализованный текст; `list_event_roles` возвращает уже использованные.
+- **Участники** должны существовать как сущности (иначе `unknown_entity`, как для фактов).
+- **Изменяемость.** Событие изменяется на месте, включая `summary`; истории версий нет (`updated_at` показывает, что событие правили). Ошибочное событие отзывается (`retract_event`).
+- **Evidence необязателен** и может быть стёрт со временем (раздел 12), поэтому `summary` должен быть самодостаточным.
+- Событие и факты связывает общий `evidence_id`; отдельной ссылки «факт выведен из события» нет.
+- Связи между событиями (причина и следствие, последовательность) — v2.
+
+Операции записи (в `apply`):
+
+| Операция | Назначение |
+|---|---|
+| `add_event` | `summary`, `details?`, `keywords[]`, `time[]` (хотя бы одна запись), `entities[{entity, role?}]`, `evidence?`; возвращает `id` |
+| `update_event` | `id` и любые из: `summary`, `details`, `keywords` (`{set}` или `{add, remove}`), `time` (замена по шкалам), `entities` (`{add, remove}`), `evidence` |
+| `retract_event` | отозвать по `id` (необязательный `evidence`) |
+
+Операции чтения (в `query`):
+
+| Операция | Назначение |
+|---|---|
+| `get_event(id)` | событие со временем и участниками |
+| `search_events({text?, keywords?, match?, entities?, when?, limit})` | поиск; `match` = `any` (по умолчанию) или `all` для ключевых слов; условия соединяются через AND; сортировка по времени события (новые первыми) |
+| `entity_events(entity, when?, limit)` | события сущности |
+| `list_event_roles` | использованные роли |
+
+`when` для событий: `at` — события, чей интервал содержит момент; `during` — пересекающие промежуток. События без времени на указанной шкале в выборку по `when` не попадают. Ответы возвращают `total` и `truncated`, как `neighbors`.
+
+## 12. Evidence
+
+Evidence — исходный материал, из которого выведены факты и события. Он необязателен и может со временем стираться или обрезаться; факты и события должны оставаться понятными без него.
+
+```sql
+CREATE TABLE evidence_source (
+  id             smallint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  name           text  NOT NULL UNIQUE,   -- 'telegram_message'
+  plugin         text  NOT NULL,          -- плагин-источник (например telegram_source)
+  description    text  NOT NULL,          -- для LLM: что это за источник
+  payload_schema jsonb NOT NULL           -- JSON Schema того, что присылает клиент
+);
+
+CREATE TABLE evidence_log (
+  id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  source_id       smallint NOT NULL REFERENCES evidence_source(id),
+  payload         jsonb,                  -- NULL после полного стирания
+  created_at      timestamptz NOT NULL DEFAULT now(),
+  retention_state jsonb,                  -- принадлежит плагину; ядро не читает
+  purged_at       timestamptz,
+  pinned          boolean NOT NULL DEFAULT false   -- не трогать политикой хранения
 );
 ```
 
-Факты ссылаются на `evidence_id`. Объём сохраняемых данных задаёт плагин источника.
+Принципы:
+- **Клиент не знает про хранение.** LLM-клиент всегда присылает полный payload по `payload_schema`. Что сохранить и как состарить данные, решает плагин источника по собственной конфигурации (она хранится у плагина, не в БД; ядро видит её как непрозрачный JSON).
+- **Любая запись проходит через плагин.** `add_evidence(source, payload)`: ядро проверяет payload по `payload_schema` (ошибка `invalid_payload`), затем передаёт плагину; тот возвращает то, что нужно сохранить (и, если нужно, начальное `retention_state`). Источник без зарегистрированного плагина — ошибка `unknown_source`.
+- **Политика хранения целиком в плагине.** Ядру известны только `purged_at` и `pinned`.
+- Сохранённый payload может быть подмножеством присланного, поэтому читатель не должен рассчитывать на наличие любых полей; `get_evidence(id)` возвращает оставшееся и `purged_at`.
 
-## 12. Открытые риски (проверяются спайком до реализации)
+Служебные операции (HTTP, не для LLM):
+- `apply_retention({source?})` — ядро пачками передаёт плагину записи (кроме `pinned`) и текущий момент; плагин для каждой возвращает действие: оставить, заменить `payload` и `retention_state`, или стереть. Ядро применяет результат в транзакции (при стирании: `payload = NULL`, `purged_at = now()`). Операция идемпотентна, ответственность за идемпотентность на плагине. Автоматический запуск по расписанию — позже; в v1 вызывается вручную;
+- `purge_evidence({ids | source, older_than})` — ручное полное стирание;
+- `pin_evidence(id)` / `unpin_evidence(id)`.
 
-1. **Отсечение ветвей в AGE.** Фильтр по свойствам рёбер должен применяться на каждом шаге, а не после развёртки всех путей. Если нет — вариант AGE не подходит для 5–6 шагов. Проверка через `EXPLAIN` на синтетическом графе.
-2. **Индексы на свойствах рёбер** в AGE (expression-индексы на `agtype`).
-3. **Закрытие интервала связи** через Cypher `SET` в одной транзакции с SQL.
-4. **Хостинг**: доступность AGE у выбранного провайдера PostgreSQL.
-5. **Поведение `LIMIT`** при переменной глубине.
+Для LLM: `list_evidence_sources` (имя, описание, схема), `add_evidence`, `get_evidence`.
 
-Если риск 1 не подтверждается, рассматриваем вариант с Neo4j как проекцией (см. предыдущие обсуждения).
+Механизм плагинов (язык, загрузка, интерфейсы шкал времени и источников evidence) в этой спецификации не описан и проектируется отдельно.
 
-## 13. Следующие шаги
+## 13. Почему без графовой БД (результаты спайка)
 
-1. Спайк по рискам 1–5 на локальном PostgreSQL с AGE.
-2. Ревью этой спецификации.
-3. План реализации (отдельный документ, после одобрения спецификации).
+Первоначально рассматривался Apache AGE (граф в PostgreSQL). Спайк (PostgreSQL 18.6, AGE 1.8.0, 10 000 вершин, 100 000 рёбер, 500 стартов, фильтр времени на каждом шаге):
+
+| Запрос | AGE (Cypher) | Обычный SQL, индекс `(src, from, to)` |
+|---|---|---|
+| 5 шагов, 35 055 путей | 0,44 с | 0,04 с |
+| 6 шагов, 72 657 путей | 0,57 с | 0,05 с |
+
+Число путей совпало; рекурсивный CTE (достижимые вершины, глубина ≤ 5) — 15 мс. Граф синтетический (средняя степень около 10).
+
+Причины отказа от AGE:
+- через Cypher `CREATE`/`SET` не срабатывают внешние ключи (EXCLUDE и CHECK срабатывают); FK работают только при прямой SQL-вставке в таблицы меток с ручной сборкой `graphid`;
+- дублирование сущностей (таблица и вершина) и синхронизация;
+- переменная глубина с фильтром на путь падает (`no relation entry for relid 2`) — пришлось бы использовать фиксированные шаблоны;
+- загрузка через Cypher очень медленная (100k рёбер за 10+ минут против 0,43 с SQL-вставкой);
+- зависимость от внутреннего формата AGE, ограниченный хостинг.
+
+Что теряется: графовые алгоритмы (кратчайший путь, PageRank) и язык шаблонов путей. При необходимости граф можно строить проекцией поверх таблицы `relation`.
+
+## 14. Открытые вопросы
+
+Закрыто спайком 2026-10-25 (схема раздела 3–7 на обычном PostgreSQL, те же 100k рёбер, что в замере раздела 13):
+- **Индексы на `time_span`.** Хватает btree `(src, relation_type_id, time_axis)` и фильтра `time_span && ...` / `@>` по выбранным строкам: 5 шагов — 34 мс, 6 шагов — 42 мс (результаты совпали с AGE: 35 055 и 72 657 путей). GiST `(src, time_axis, time_span)` не нужен: на хабе он не ускорил запрос (12,9 мс против 6,0 мс только с btree).
+- **EXCLUDE с `COALESCE`** работает (см. раздел 6).
+- **Хаб.** Сущность с 50 000+ исходящих связей: соседи на момент `t` (13 919 строк) — 6 мс, обход на 2 шага с хаба (7 903 сущности) — 22 мс. Вставка 20 000 связей при двух индексах — 0,4 с.
+- **Конкурентный `replace_property`.** Две сессии на одном свойстве: вторая получает `UPDATE 0` (строка уже закрыта первой), затем отклоняется EXCLUDE; в БД остаётся результат первой. Данные не портятся. API при `exclusion_violation` в `replace_property` возвращает типизированную ошибку `concurrent_update`, и клиент повторяет пакет.
+
+Закрыто вторым спайком 2026-10-25 (670 000 связей, 5 типов, хаб на 500 000 связей, 200 000 текстовых значений):
+- **Хаб на 500 000 связей.** Соседи хаба на момент `t` по одному типу (27 313 строк) — 17 мс; топ-5 по свойству среди соседей хаба по трём типам — 95 мс; обход хаба на 2 шага — 87 мс; обход по уровням на 5 шагов от хаба — 0,57 с; от 500 стартов при хабе в графе — 0,73 с (все 10 000 сущностей достигнуты).
+- **Перебор путей взрывается:** 5 шагов от 500 стартов при хабе — 977 млн путей, 13,5 с. Поэтому по умолчанию `neighbors` использует обход по уровням с дедупликацией, а `paths: true` ограничен (раздел 10.3).
+- **Несколько типов связей** в одном обходе (`relation_type_id = ANY(...)`) на скорость заметно не влияют.
+- **Параллельные рёбра к одной сущности** дают дубли в топе: `neighbors` группирует по сущности.
+- **`pg_trgm`.** Расширение доступно. Редкий запрос по триграммному индексу — 0,6 мс; частый (совпадает 20% строк) выигрыша от индекса не даёт (72 мс против 81 мс); поиск по `key` сущности — 0,5 мс.
+
+Решено:
+- безвременное и временные значения одноместного свойства взаимно исключаются на уровне API (`timeless_conflict`);
+- секретный URL: один на сервис в v1;
+- пагинации нет, есть `limit` с `total` и `truncated`.
+
+- свободные данные (наблюдения вроде «видел вчера Боба, он сделал сальтуху») — отдельная сущность `event` (раздел 11);
+- хранение evidence: плагин источника владеет проверкой, обрезкой и старением payload (раздел 12).
+
+Открыто:
+1. **Механизм плагинов** (шкалы времени и источники evidence): язык, загрузка, интерфейсы, манифест — проектируется отдельно.
+2. **EXCLUDE с условием `retracted_at IS NULL`** — проверить в плане (в спайке условие было только `single_valued`).
+3. **События:** производительность `search_events` (ключевые слова, текст, фильтр по времени и участникам) не замерялась; проверить в плане.
+4. **`apply_retention`:** размер пачки и порядок обработки; автозапуск по расписанию.
+5. **Отложено на v2:** связи между событиями (причина и следствие, последовательность); фильтр и агрегаты в `neighbors`; `deprecate_type` и алиасы; `set_property_span` (правка границ истории); «сейчас» шкалы в `list_time_axes`; автоматическая политика хранения evidence по расписанию.
+
+## 15. Следующие шаги
+
+1. Ревью этой спецификации.
+2. План реализации (`superpowers:writing-plans`) после одобрения.
