@@ -1,4 +1,6 @@
 import pg from 'pg';
+import { apply, type ApplyResponse } from './api/apply.js';
+import { query, type QueryResponse } from './api/query.js';
 import { runMigrations } from './db/migrate.js';
 import {
   addPlugin,
@@ -19,6 +21,8 @@ export interface StartOptions {
 export interface RemoraApp {
   pool: pg.Pool;
   registry: PluginRegistry;
+  apply(request: unknown): Promise<ApplyResponse>;
+  query(request: unknown): Promise<QueryResponse>;
   close(): Promise<void>;
 }
 
@@ -31,7 +35,13 @@ export async function startRemora(opts: StartOptions): Promise<RemoraApp> {
       await addPlugin(pool, { package: '@remora/core-plugin' }, opts.importer);
     }
     const registry = await loadPlugins(pool, { importer: opts.importer, logger: opts.logger });
-    return { pool, registry, close: () => pool.end() };
+    return {
+      pool,
+      registry,
+      apply: (request) => apply(pool, registry, request),
+      query: (request) => query(pool, registry, request),
+      close: () => pool.end(),
+    };
   } catch (e) {
     await pool.end();
     throw e;

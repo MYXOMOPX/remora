@@ -1,5 +1,9 @@
 export type { Queryable } from './db/types.js';
 export { runMigrations } from './db/migrate.js';
+export { apply } from './api/apply.js';
+export type { ApplyResponse, ApiError } from './api/apply.js';
+export { query } from './api/query.js';
+export type { QueryResponse } from './api/query.js';
 export { startRemora } from './app.js';
 export type { RemoraApp, StartOptions } from './app.js';
 export { addPlugin, loadPlugins, CORE_PLUGIN_NAME } from './plugins/registry.js';

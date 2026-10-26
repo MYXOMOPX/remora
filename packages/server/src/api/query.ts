@@ -1,0 +1,196 @@
+import { RemoraError } from '@remora/sdk';
+import type pg from 'pg';
+import type { Queryable } from '../db/types.js';
+import type { PluginRegistry } from '../plugins/registry.js';
+import {
+  findPropertyTypes,
+  findRelationTypes,
+  listPropertyTypes,
+  listRelationTypes,
+  listTimeAxes,
+  type PropertyType,
+  type RelationType,
+} from '../services/dictionaries.js';
+import { findEntities, requireEntity } from '../services/entities.js';
+import {
+  propertyAt,
+  propertyHistory,
+  relationHistory,
+  type PropertyRow,
+  type RelationRow,
+} from '../services/facts-read.js';
+import { parseWhen } from '../services/time.js';
+import { isObj, optBool, optInt, optStr, optStrArr, str, type Obj } from './args.js';
+import { failure, mapPgError, rollback, type ApiError } from './apply.js';
+
+export type QueryResponse = { ok: true; results: unknown[] } | { ok: false; error: ApiError };
+
+interface Env {
+  db: Queryable;
+  registry: PluginRegistry;
+}
+
+type Handler = (env: Env, o: Obj) => Promise<unknown>;
+
+// Rows are converted field by field: `value`, `time` and axis schemas are plugin/user data
+// and must not go through the key-renaming toApi.
+function withMeta(base: Obj, r: PropertyRow | RelationRow): Obj {
+  const out: Obj = {
+    ...base,
+    time: r.time,
+    evidence_id: r.evidenceId === null ? null : Number(r.evidenceId),
+    recorded_at: r.recordedAt.toISOString(),
+  };
+  if (r.retractedAt !== null) out.retracted_at = r.retractedAt.toISOString();
+  return out;
+}
+
+const propertyRow = (r: PropertyRow): Obj => withMeta({ id: Number(r.id), value: r.value }, r);
+
+const relationRow = (r: RelationRow): Obj =>
+  withMeta(
+    { id: Number(r.id), relation_id: Number(r.relationId), type: r.type, from: r.from, to: r.to },
+    r,
+  );
+
+const relationType = (t: RelationType): Obj => ({
+  id: t.id,
+  name: t.name,
+  description: t.description,
+  directed: t.directed,
+});
+
+const propertyType = (t: PropertyType): Obj => ({
+  id: t.id,
+  name: t.name,
+  description: t.description,
+  value_type: t.valueType,
+  single_valued: t.singleValued,
+});
+
+function invalid(message: string, field: string): RemoraError {
+  return new RemoraError('invalid_param', message, { field });
+}
+
+const HANDLERS: Record<string, Handler> = {
+  async get_entity({ db }, o) {
+    return { key: (await requireEntity(db, str(o, 'key'))).key };
+  },
+  async find_entities({ db }, o) {
+    const query = str(o, 'query');
+    const limit = optInt(o, 'limit');
+    const r = await findEntities(db, { query, ...(limit !== undefined ? { limit } : {}) });
+    return { rows: r.rows.map((e) => ({ key: e.key })), total: r.total, truncated: r.truncated };
+  },
+  async property_at({ db, registry }, o) {
+    const entity = str(o, 'entity');
+    const property = str(o, 'property');
+    const when = parseWhen(registry, o.when);
+    if (when === undefined) throw invalid('when is required', 'when');
+    const rows = await propertyAt(db, registry, { entity, property, when });
+    return { rows: rows.map(propertyRow) };
+  },
+  async property_history({ db, registry }, o) {
+    const entity = str(o, 'entity');
+    const property = str(o, 'property');
+    const axisName = optStr(o, 'axis');
+    const includeRetracted = optBool(o, 'include_retracted');
+    const rows = await propertyHistory(db, registry, {
+      entity,
+      property,
+      ...(axisName !== undefined ? { axis: registry.getAxis(axisName) } : {}),
+      ...(includeRetracted !== undefined ? { includeRetracted } : {}),
+    });
+    return { rows: rows.map(propertyRow) };
+  },
+  async relation_history({ db, registry }, o) {
+    const entity = str(o, 'entity');
+    const relationTypes = optStrArr(o, 'relation_types');
+    if (relationTypes !== undefined && relationTypes.length === 0) {
+      throw invalid('relation_types must not be empty', 'relation_types');
+    }
+    const direction = optStr(o, 'direction');
+    if (direction !== undefined && direction !== 'out' && direction !== 'in' && direction !== 'both') {
+      throw invalid('direction must be out, in or both', 'direction');
+    }
+    const when = parseWhen(registry, o.when);
+    const includeRetracted = optBool(o, 'include_retracted');
+    const limit = optInt(o, 'limit');
+    const r = await relationHistory(db, registry, {
+      entity,
+      ...(relationTypes !== undefined ? { relationTypes } : {}),
+      ...(direction !== undefined ? { direction } : {}),
+      ...(when !== undefined ? { when } : {}),
+      ...(includeRetracted !== undefined ? { includeRetracted } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    });
+    return { rows: r.rows.map(relationRow), total: r.total, truncated: r.truncated };
+  },
+  async list_relation_types({ db }) {
+    return { rows: (await listRelationTypes(db)).map(relationType) };
+  },
+  async find_relation_types({ db }, o) {
+    return { rows: (await findRelationTypes(db, str(o, 'query'))).map(relationType) };
+  },
+  async list_property_types({ db }) {
+    return { rows: (await listPropertyTypes(db)).map(propertyType) };
+  },
+  async find_property_types({ db }, o) {
+    return { rows: (await findPropertyTypes(db, str(o, 'query'))).map(propertyType) };
+  },
+  async list_time_axes({ db }) {
+    const axes = await listTimeAxes(db);
+    return {
+      rows: axes.map((a) => ({
+        name: a.name,
+        description: a.description,
+        value_schema: a.valueSchema,
+        example: a.example,
+      })),
+    };
+  },
+};
+
+export async function query(pool: pg.Pool, registry: PluginRegistry, request: unknown): Promise<QueryResponse> {
+  const bad = (message: string): QueryResponse => ({
+    ok: false,
+    error: { op_index: -1, code: 'invalid_param', message },
+  });
+  if (!isObj(request)) return bad('request must be an object {ops: [...]}');
+  const ops = request.ops;
+  if (!Array.isArray(ops) || ops.length === 0) return bad('ops must be a non-empty array');
+
+  const client = await pool.connect();
+  let destroy: Error | undefined;
+  try {
+    await client.query('BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY');
+    const env: Env = { db: client, registry };
+    const results: unknown[] = [];
+    for (let i = 0; i < ops.length; i++) {
+      const op: unknown = ops[i];
+      try {
+        if (!isObj(op)) throw new RemoraError('invalid_param', 'op must be an object');
+        const name = op.op;
+        // neighbors, event and evidence ops arrive in plan 3: unknown here
+        const handler = typeof name === 'string' && Object.hasOwn(HANDLERS, name) ? HANDLERS[name] : undefined;
+        if (!handler) {
+          throw new RemoraError('invalid_param', `unknown op: ${String(name)}`, { op: name });
+        }
+        results.push(await handler(env, op));
+      } catch (e) {
+        const mapped = e instanceof RemoraError ? e : mapPgError(e);
+        if (!mapped) throw e;
+        destroy = await rollback(client);
+        return failure(i, mapped, op, registry);
+      }
+    }
+    destroy = await rollback(client);
+    if (destroy) throw destroy;
+    return { ok: true, results };
+  } catch (e) {
+    destroy = (await rollback(client)) ?? destroy;
+    throw e;
+  } finally {
+    client.release(destroy);
+  }
+}

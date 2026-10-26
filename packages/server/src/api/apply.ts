@@ -202,7 +202,7 @@ const HANDLERS: Record<string, Handler> = {
 };
 
 /** snake_case + JSON-number conversion of service results (bigint -> number). */
-function toApi(x: unknown): unknown {
+export function toApi(x: unknown): unknown {
   if (typeof x === 'bigint') return Number(x);
   if (x instanceof Date) return x.toISOString();
   if (Array.isArray(x)) return x.map(toApi);
@@ -242,7 +242,7 @@ function normaliseDetails(
   return out;
 }
 
-function failure(index: number, e: RemoraError, op: unknown, registry: PluginRegistry): ApplyResponse {
+export function failure(index: number, e: RemoraError, op: unknown, registry: PluginRegistry): ApplyResponse {
   const details = normaliseDetails(e, op, registry);
   const error: ApiError = { op_index: index, code: e.code, message: e.message };
   if (details !== undefined) error.details = details;
@@ -250,7 +250,7 @@ function failure(index: number, e: RemoraError, op: unknown, registry: PluginReg
 }
 
 /** Returns an Error when ROLLBACK failed, so the client (unknown tx state) is destroyed on release. */
-async function rollback(client: pg.PoolClient): Promise<Error | undefined> {
+export async function rollback(client: pg.PoolClient): Promise<Error | undefined> {
   try {
     await client.query('ROLLBACK');
     return undefined;
