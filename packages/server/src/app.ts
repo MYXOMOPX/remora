@@ -3,6 +3,14 @@ import { apply, type ApplyResponse } from './api/apply.js';
 import { query, type QueryResponse } from './api/query.js';
 import { runMigrations } from './db/migrate.js';
 import {
+  applyRetention,
+  pinEvidence,
+  purgeEvidence,
+  unpinEvidence,
+  type PurgeArgs,
+  type RetentionReport,
+} from './services/evidence-maintenance.js';
+import {
   addPlugin,
   CORE_PLUGIN_NAME,
   loadPlugins,
@@ -23,6 +31,10 @@ export interface RemoraApp {
   registry: PluginRegistry;
   apply(request: unknown): Promise<ApplyResponse>;
   query(request: unknown): Promise<QueryResponse>;
+  applyRetention(a?: { source?: string; batchSize?: number; now?: Date }): Promise<RetentionReport>;
+  purgeEvidence(a: PurgeArgs): Promise<{ purged: number; skippedPinned: number }>;
+  pinEvidence(id: bigint): Promise<void>;
+  unpinEvidence(id: bigint): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -40,6 +52,10 @@ export async function startRemora(opts: StartOptions): Promise<RemoraApp> {
       registry,
       apply: (request) => apply(pool, registry, request),
       query: (request) => query(pool, registry, request),
+      applyRetention: (a) => applyRetention(pool, registry, a),
+      purgeEvidence: (a) => purgeEvidence(pool, a),
+      pinEvidence: (id) => pinEvidence(pool, id),
+      unpinEvidence: (id) => unpinEvidence(pool, id),
       close: () => pool.end(),
     };
   } catch (e) {
