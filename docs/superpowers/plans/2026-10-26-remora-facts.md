@@ -28,6 +28,7 @@
 
 ## Rulings (decisions the spec leaves open or that deviate from it)
 
+- **R0 sequence name.** `relation_id_seq` is already the identity sequence of `relation.id`; the logical id sequence is `relation_logical_id_seq` (migration `002_relation_logical_id_seq.sql`).
 - **R1 write lock.** Every property write (single- and multi-valued alike, for simplicity) takes `pg_advisory_xact_lock(hashtextextended('prop:' || $entityId || ':' || $propertyTypeId, 0))` before it reads any `property_version` row. `retractProperty` first reads `entity_id, property_type_id` of the target row (no lock needed for that read), then takes the lock, then updates with `WHERE id = $1 AND retracted_at IS NULL`. With writers serialised under READ COMMITTED, a remaining EXCLUDE violation (`23P01`) is a real overlap → `single_valued_conflict`. `concurrent_update` is returned only for `40001`/`40P01` (e.g. two batches locking the same two properties in opposite order deadlock → `40P01`). **Deviation from spec 15** (which maps EXCLUDE in `replace_property` to `concurrent_update`): the lock makes the race impossible and gives a precise error.
 - **R2 closing bound.** Closing a row at `at` requires `lower(time_span) IS NULL OR at > lower(time_span)`; otherwise `invalid_time` with `details: {id, from, at}` and nothing is changed. **Deviation from spec 6** ("`at ≥ from`"): `at == from` would make an empty span, which `CHECK (NOT isempty(time_span))` rejects; the fix is retract + add. If any candidate row fails R2, the whole op fails.
 - **R3 timeless vs timed (single-valued only).** Adding/replacing a timed value while a non-retracted timeless row exists, or adding/replacing a timeless value while any non-retracted timed row exists (open or closed, any axis) → `timeless_conflict`. A second timeless value via `add_property` → `single_valued_conflict` (from EXCLUDE). Multi-valued properties have no such checks.
@@ -52,17 +53,17 @@
 ### Task 1: Migration 002, registry lookup by id, ajv-formats
 
 **Files:**
-- Create: `packages/server/migrations/002_relation_seq.sql`
+- Create: `packages/server/migrations/002_relation_logical_id_seq.sql`
 - Modify: `packages/server/src/plugins/registry.ts`, `packages/server/package.json` (dependency `ajv-formats`), `package-lock.json`
 - Test: `packages/server/test/schema.test.ts` (extend), `packages/server/test/registry.test.ts` (extend), `packages/server/test/migrate.test.ts` (update)
 
 **Interfaces:**
-- Produces: sequence `relation_id_seq` (`bigint`, start 1); `PluginRegistry.getAxisById(id: number): { id: number; name: string; def: TimeAxisDef }`; `getAxis(name)` now returns the same shape (adds `name`).
+- Produces: sequence `relation_logical_id_seq` (`bigint`, start 1); `PluginRegistry.getAxisById(id: number): { id: number; name: string; def: TimeAxisDef }`; `getAxis(name)` now returns the same shape (adds `name`).
 - `getAxisById` semantics: id served by a loaded plugin → the axis; id present in `time_axis` but not served (its plugin failed, or the plugin no longer declares it) → `axis_unavailable`; id absent from `time_axis` → `unknown_axis`. Implementation: at the end of `loadPlugins` read `SELECT id, name FROM time_axis`; keep `axesById` for served axes and the rest as unavailable ids.
 
-- [ ] **Step 1: Write failing tests.** `schema.test.ts`: `SELECT nextval('relation_id_seq') AS n` returns `'1'` then `'2'` (bigint comes back as string) on a fresh DB. (The EXCLUDE-with-retraction case is already covered by the existing test "retracted row does not block"; do not duplicate it.) `migrate.test.ts`: the first `runMigrations` now returns `['001_init.sql', '002_relation_seq.sql']` and `schema_migration` has both names — update the existing expectations. `registry.test.ts`: `getAxisById(reg.getAxis('day').id)` deep-equals `reg.getAxis('day')` and has `name: 'day'`; `getAxisById(9999)` → `unknown_axis`; in the existing "a plugin whose setup throws is unavailable" setup (axis `bad_axis` pre-registered in `time_axis`), `getAxisById(<id of bad_axis from time_axis>)` → `axis_unavailable`.
+- [ ] **Step 1: Write failing tests.** `schema.test.ts`: `SELECT nextval('relation_logical_id_seq') AS n` returns `'1'` then `'2'` (bigint comes back as string) on a fresh DB. (The EXCLUDE-with-retraction case is already covered by the existing test "retracted row does not block"; do not duplicate it.) `migrate.test.ts`: the first `runMigrations` now returns `['001_init.sql', '002_relation_logical_id_seq.sql']` and `schema_migration` has both names — update the existing expectations. `registry.test.ts`: `getAxisById(reg.getAxis('day').id)` deep-equals `reg.getAxis('day')` and has `name: 'day'`; `getAxisById(9999)` → `unknown_axis`; in the existing "a plugin whose setup throws is unavailable" setup (axis `bad_axis` pre-registered in `time_axis`), `getAxisById(<id of bad_axis from time_axis>)` → `axis_unavailable`.
 - [ ] **Step 2: Run** `npx vitest run packages/server/test/schema.test.ts packages/server/test/registry.test.ts packages/server/test/migrate.test.ts`; expect the new tests to fail.
-- [ ] **Step 3: Implement.** SQL: `CREATE SEQUENCE relation_id_seq AS bigint;`. Registry as described above. `npm install ajv-formats@^3 -w @remora/server`. Under NodeNext the default import of this CJS package is the module namespace, so `import addFormats from 'ajv-formats'; addFormats(ajv)` fails typecheck (TS2349, verified). Use exactly: `import addFormatsModule from 'ajv-formats'; const addFormats = addFormatsModule.default;` (works in both `tsc` and vitest/Node). Ajv itself stays `import { Ajv } from 'ajv'`.
+- [ ] **Step 3: Implement.** SQL: `CREATE SEQUENCE relation_logical_id_seq AS bigint;`. Registry as described above. `npm install ajv-formats@^3 -w @remora/server`. Under NodeNext the default import of this CJS package is the module namespace, so `import addFormats from 'ajv-formats'; addFormats(ajv)` fails typecheck (TS2349, verified). Use exactly: `import addFormatsModule from 'ajv-formats'; const addFormats = addFormatsModule.default;` (works in both `tsc` and vitest/Node). Ajv itself stays `import { Ajv } from 'ajv'`.
 - [ ] **Step 4: Run** the full suite `npm test` and `npm run typecheck`; expect green.
 - [ ] **Step 5: Commit** the changed files by name: `feat: relation id sequence, axis lookup by id, ajv-formats`.
 
@@ -156,11 +157,11 @@ Order inside `add`/`replace`/`end`: resolve entity (`unknown_entity`) and proper
 - Test: `packages/server/test/relations.test.ts`
 
 **Interfaces:**
-- Consumes: Task 2 (`Span`, `Moment`, `AxisRef`, `seedAxes`), `requireEntity`, `normalizeName`, `relation_id_seq` (Task 1).
+- Consumes: Task 2 (`Span`, `Moment`, `AxisRef`, `seedAxes`), `requireEntity`, `normalizeName`, `relation_logical_id_seq` (Task 1).
 - Produces:
   - `resolveRelationType(db, name: string): Promise<{ id: number; name: string; directed: boolean }>` — exported (Task 6 uses it); lookup by `normalizeName(name)`; missing → `unknown_type`.
   - `type RelationRef = { relationId: bigint } | { type: string; from: string; to: string }`
-  - `addRelation(db, a: { type: string; from: string; to: string; spans: Span[]; evidenceId?: bigint }): Promise<{ relationId: bigint; ids: bigint[] }>` — `nextval('relation_id_seq')` once, one row per span (none → one timeless row).
+  - `addRelation(db, a: { type: string; from: string; to: string; spans: Span[]; evidenceId?: bigint }): Promise<{ relationId: bigint; ids: bigint[] }>` — `nextval('relation_logical_id_seq')` once, one row per span (none → one timeless row).
   - `endRelation(db, a: { ref: RelationRef; moment: Moment; evidenceId?: bigint }): Promise<{ closed: bigint[] }>` — closes matched rows on `moment.axis` with `upper(time_span) IS NULL` (R2 for every row, R6, R8); none → `not_found`.
   - `retractRelation(db, a: { ref: RelationRef; axis?: AxisRef; evidenceId?: bigint }): Promise<{ retracted: bigint[] }>` — all matched rows (or only rows with `time_axis = axis.id`); none → `not_found`.
   - Internal `matchRows(db, ref, extraWhere)`: `SELECT id, lower(time_span)::text AS lo ... FOR UPDATE` over non-retracted rows. Selector: resolve type and both entities first (`unknown_type`/`unknown_entity`), match `relation_type_id = $t AND ((src=$from AND dst=$to)` plus, if the type is undirected, `OR (src=$to AND dst=$from))`. `{relationId}`: `relation_id = $id`; no rows → `not_found`. `FOR UPDATE` makes a concurrent second `end_relation` re-check `upper(time_span) IS NULL` after the first commits and find nothing (`not_found`) instead of overwriting.
