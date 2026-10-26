@@ -1,0 +1,14 @@
+import { definePlugin } from '@remora/sdk';
+import { buildAxis } from './axes.js';
+import { configSchema, defaultConfig, type CoreConfig } from './config.js';
+
+export type { AxisConfig } from './axes.js';
+export { buildAxis } from './axes.js';
+export type { CoreConfig } from './config.js';
+
+export default definePlugin<CoreConfig>({
+  name: 'remora-core',
+  configSchema,
+  defaultConfig,
+  setup: (config) => ({ timeAxes: config.timeAxes.map(buildAxis) }),
+});
