@@ -12,6 +12,7 @@ import {
   type RelationType,
 } from '../services/dictionaries.js';
 import { findEntities, requireEntity } from '../services/entities.js';
+import { getEvidence, listEvidenceSources } from '../services/evidence.js';
 import {
   propertyAt,
   propertyHistory,
@@ -21,7 +22,7 @@ import {
 } from '../services/facts-read.js';
 import { neighbors, type NeighborRow } from '../services/neighbors.js';
 import { parseWhen } from '../services/time.js';
-import { isObj, optBool, optInt, optStr, optStrArr, str, type Obj } from './args.js';
+import { int, isObj, optBool, optInt, optStr, optStrArr, str, type Obj } from './args.js';
 import { failure, mapPgError, rollback, type ApiError } from './apply.js';
 
 export type QueryResponse = { ok: true; results: unknown[] } | { ok: false; error: ApiError };
@@ -198,6 +199,25 @@ const HANDLERS: Record<string, Handler> = {
   },
   async find_property_types({ db }, o) {
     return { rows: (await findPropertyTypes(db, str(o, 'query'))).map(propertyType) };
+  },
+  async list_evidence_sources({ db }) {
+    const rows = await listEvidenceSources(db);
+    return {
+      rows: rows.map((s) => ({ name: s.name, description: s.description, payload_schema: s.payloadSchema })),
+    };
+  },
+  async get_evidence({ db }, o) {
+    const id = int(o, 'id');
+    if (id < 1) throw invalid('id must be a positive integer', 'id');
+    const e = await getEvidence(db, BigInt(id));
+    return {
+      id: Number(e.id),
+      source: e.source,
+      payload: e.payload,
+      created_at: e.createdAt.toISOString(),
+      purged_at: e.purgedAt === null ? null : e.purgedAt.toISOString(),
+      pinned: e.pinned,
+    };
   },
   async list_time_axes({ db }) {
     const axes = await listTimeAxes(db);

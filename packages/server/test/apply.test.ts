@@ -189,7 +189,7 @@ describe('apply', () => {
       await withDb(async ({ run }) => {
         const e = errOf(await run({ op: 'frobnicate' }));
         expect(e).toMatchObject({ op_index: 0, code: 'invalid_param', details: { op: 'frobnicate' } });
-        expect(errOf(await run({ op: 'add_evidence' }))).toMatchObject({ code: 'invalid_param' });
+        expect(errOf(await run({ op: 'add_evidence', payload: {} }))).toMatchObject({ code: 'invalid_param' });
         expect(errOf(await run({ op: 'add_property', property: 'nickname', value: 'x' }))).toMatchObject({
           code: 'invalid_param',
         });

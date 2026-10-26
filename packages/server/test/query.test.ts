@@ -211,8 +211,6 @@ describe('query', () => {
         'search_events',
         'entity_events',
         'list_event_roles',
-        'list_evidence_sources',
-        'get_evidence',
         'frobnicate',
       ];
       for (const op of names) {
