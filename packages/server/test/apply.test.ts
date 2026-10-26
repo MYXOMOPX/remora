@@ -303,10 +303,10 @@ describe('apply', () => {
         const pt = { op: 'create_property_type', name: 'shoe', description: 'd', value_type: 'number', single_valued: true, as: 'p' };
         expect(
           errOf(await run(pt, { op: 'add_property', entity: 'bob', property: 'nickname', value: 'x', evidence: '$p' })),
-        ).toMatchObject({ op_index: 1, code: 'unknown_ref' });
+        ).toMatchObject({ op_index: 1, code: 'unknown_ref', details: { ref: '$p' } });
         expect(
           errOf(await run(pt, { op: 'add_property', entity: '$p', property: 'nickname', value: 'x' })),
-        ).toMatchObject({ op_index: 1, code: 'unknown_ref' });
+        ).toMatchObject({ op_index: 1, code: 'unknown_ref', details: { ref: '$p' } });
       });
     });
 
@@ -353,7 +353,7 @@ describe('apply', () => {
         query: (sql: string) => {
           calls.push(sql);
           const err = failOn(sql);
-          return err ? Promise.reject(err) : Promise.resolve({ rows: [], rowCount: 0 });
+          return err ? Promise.reject(err) : Promise.resolve({ rows: [{ entity_id: '1', key: 'z' }], rowCount: 1 });
         },
         release: (err?: unknown) => released.push(err),
       };
@@ -367,6 +367,15 @@ describe('apply', () => {
         expect(errOf(r)).toMatchObject({ op_index: 0, code: 'concurrent_update' });
         expect(s.calls).toContain('ROLLBACK');
         expect(s.released).toEqual([undefined]);
+      });
+    });
+
+    it('COMMIT failure with a mapped pg error -> concurrent_update', async () => {
+      await withDb(async ({ reg }) => {
+        const s = stubPool((sql) => (sql === 'COMMIT' ? { code: '40001' } : null));
+        const r = await apply(s.pool, reg, { ops: [{ op: 'create_entity', key: 'z' }] });
+        expect(errOf(r)).toMatchObject({ code: 'concurrent_update' });
+        expect(s.calls).toContain('ROLLBACK');
       });
     });
 

@@ -311,7 +311,15 @@ export async function apply(pool: pg.Pool, registry: PluginRegistry, request: un
         return failure(i, mapped, op, registry);
       }
     }
-    await client.query('COMMIT');
+    try {
+      await client.query('COMMIT');
+    } catch (e) {
+      const mapped = mapPgError(e);
+      if (!mapped) throw e;
+      destroy = await rollback(client);
+      // not tied to a single op: batch-level failure
+      return failure(-1, mapped, undefined, registry);
+    }
     return { ok: true, results };
   } catch (e) {
     destroy = (await rollback(client)) ?? destroy;
