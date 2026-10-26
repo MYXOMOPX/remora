@@ -1,4 +1,5 @@
 import { Ajv } from 'ajv';
+import addFormatsModule from 'ajv-formats';
 import {
   RemoraError,
   type EvidenceSourceDef,
@@ -16,14 +17,23 @@ export interface Logger {
 
 export const CORE_PLUGIN_NAME = 'remora-core';
 
+export interface AxisInfo {
+  id: number;
+  name: string;
+  def: TimeAxisDef;
+}
+
 export interface PluginRegistry {
-  getAxis(name: string): { id: number; def: TimeAxisDef };
+  getAxis(name: string): AxisInfo;
+  getAxisById(id: number): AxisInfo;
   status(): { name: string; ok: boolean; error?: string }[];
 }
 
 const defaultImporter: Importer = async (spec) => ((await import(spec)) as { default: unknown }).default;
 
+const addFormats = addFormatsModule.default;
 const ajv = new Ajv();
+addFormats(ajv);
 
 function checkConfig(def: PluginDef, config: unknown, what: string): void {
   let ok: boolean;
@@ -140,7 +150,7 @@ export async function loadPlugins(
 
   const { rows: plugins } = await db.query<PluginRow>('SELECT id, name, package, config FROM plugin ORDER BY id');
   const statuses: { name: string; ok: boolean; error?: string }[] = [];
-  const axes = new Map<string, { id: number; def: TimeAxisDef }>();
+  const axes = new Map<string, AxisInfo>();
   const unavailableAxes = new Map<string, string>();
 
   for (const p of plugins) {
@@ -179,7 +189,7 @@ export async function loadPlugins(
          RETURNING id`,
         [a.name, p.id, a.description, JSON.stringify(a.valueSchema), JSON.stringify(a.example)],
       );
-      axes.set(a.name, { id: r.rows[0]!.id, def: a });
+      axes.set(a.name, { id: r.rows[0]!.id, name: a.name, def: a });
     }
     for (const s of setupResult.evidenceSources ?? ([] as EvidenceSourceDef[])) {
       await assertNameFree(db, 'evidence_source', s.name, p.id);
@@ -195,7 +205,22 @@ export async function loadPlugins(
     statuses.push({ name: p.name, ok: true });
   }
 
+  const axesById = new Map<number, AxisInfo>();
+  for (const a of axes.values()) axesById.set(a.id, a);
+  const unavailableIds = new Map<number, string>();
+  const { rows: allAxes } = await db.query<{ id: number; name: string }>('SELECT id, name FROM time_axis');
+  for (const r of allAxes) if (!axesById.has(r.id)) unavailableIds.set(r.id, r.name);
+
   return {
+    getAxisById(id) {
+      const hit = axesById.get(id);
+      if (hit) return hit;
+      const name = unavailableIds.get(id);
+      if (name !== undefined) {
+        throw new RemoraError('axis_unavailable', `time axis ${name} (id ${id}) is not served by a loaded plugin`);
+      }
+      throw new RemoraError('unknown_axis', `unknown time axis id ${id}`);
+    },
     getAxis(name) {
       const hit = axes.get(name);
       if (hit) return hit;

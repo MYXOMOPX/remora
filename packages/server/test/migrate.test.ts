@@ -9,10 +9,10 @@ describe('runMigrations', () => {
   it('applies migrations once and records them', async () => {
     const { pool, drop } = await createTestDb();
     try {
-      expect(await runMigrations(pool)).toEqual(['001_init.sql']);
+      expect(await runMigrations(pool)).toEqual(['001_init.sql', '002_relation_logical_id_seq.sql']);
       expect(await runMigrations(pool)).toEqual([]);
-      const { rows } = await pool.query('SELECT name FROM schema_migration');
-      expect(rows).toEqual([{ name: '001_init.sql' }]);
+      const { rows } = await pool.query('SELECT name FROM schema_migration ORDER BY name');
+      expect(rows).toEqual([{ name: '001_init.sql' }, { name: '002_relation_logical_id_seq.sql' }]);
     } finally {
       await drop();
     }

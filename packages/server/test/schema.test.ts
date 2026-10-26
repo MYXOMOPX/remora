@@ -229,4 +229,11 @@ describe('schema constraints', () => {
       await add('witness');
       await expect(add('actor')).rejects.toMatchObject({ code: '23505' });
     }));
+
+  it('relation_logical_id_seq yields 1 then 2', () =>
+    withDb(async (db) => {
+      const a = await db.query<{ n: string }>(`SELECT nextval('relation_logical_id_seq') AS n`);
+      const b = await db.query<{ n: string }>(`SELECT nextval('relation_logical_id_seq') AS n`);
+      expect([a.rows[0]!.n, b.rows[0]!.n]).toEqual(['1', '2']);
+    }));
 });

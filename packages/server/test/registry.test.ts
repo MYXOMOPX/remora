@@ -155,11 +155,13 @@ describe('plugin registry', () => {
     await withDb(async (pool) => {
       await insertPlugin(pool, 'good');
       const badId = await insertPlugin(pool, 'bad');
-      await pool.query(
-        `INSERT INTO time_axis (name, plugin_id, description, value_schema, example)
-         VALUES ('bad_axis', $1, 'x', '{"type":"integer"}', '1')`,
-        [badId],
-      );
+      const badAxisId = (
+        await pool.query<{ id: number }>(
+          `INSERT INTO time_axis (name, plugin_id, description, value_schema, example)
+           VALUES ('bad_axis', $1, 'x', '{"type":"integer"}', '1') RETURNING id`,
+          [badId],
+        )
+      ).rows[0]!.id;
       const bad = plug('bad', ['bad_axis'], {
         setup: () => {
           throw new Error('boom');
@@ -177,6 +179,7 @@ describe('plugin registry', () => {
       expect(logger.error).toHaveBeenCalled();
       expect(reg.getAxis('good_axis').def.name).toBe('good_axis');
       expect(() => reg.getAxis('bad_axis')).toThrow(code('axis_unavailable'));
+      expect(() => reg.getAxisById(badAxisId)).toThrow(code('axis_unavailable'));
     });
   });
 
@@ -237,6 +240,27 @@ describe('plugin registry', () => {
     await withDb(async (pool) => {
       const reg = await loadPlugins(pool, { importer: importerOf({}) });
       expect(() => reg.getAxis('nope')).toThrow(code('unknown_axis'));
+    });
+  });
+
+  it('getAxisById returns the served axis, rejects unknown ids', async () => {
+    await withDb(async (pool) => {
+      await insertPlugin(pool, 'fake-a');
+      const reg = await loadPlugins(pool, { importer: importerOf({ 'fake-a': plug('fake-a', ['day']) }) });
+      const day = reg.getAxis('day');
+      expect(day.name).toBe('day');
+      expect(reg.getAxisById(day.id)).toEqual(day);
+      expect(() => reg.getAxisById(9999)).toThrow(code('unknown_axis'));
+    });
+  });
+
+  it('getAxisById of an axis the plugin no longer declares is axis_unavailable', async () => {
+    await withDb(async (pool) => {
+      await insertPlugin(pool, 'fake-a');
+      const r1 = await loadPlugins(pool, { importer: importerOf({ 'fake-a': plug('fake-a', ['day']) }) });
+      const id = r1.getAxis('day').id;
+      const r2 = await loadPlugins(pool, { importer: importerOf({ 'fake-a': plug('fake-a', []) }) });
+      expect(() => r2.getAxisById(id)).toThrow(code('axis_unavailable'));
     });
   });
 
