@@ -1,6 +1,7 @@
 import type { AxisConfig } from './axes.js';
+import type { SourceConfig } from './sources.js';
 
-export type CoreConfig = { timeAxes: AxisConfig[] };
+export type CoreConfig = { timeAxes: AxisConfig[]; evidenceSources?: SourceConfig[] };
 
 export const defaultConfig: CoreConfig = {
   timeAxes: [
@@ -30,11 +31,23 @@ export const defaultConfig: CoreConfig = {
       example: { tome: 10, chapter: 5 },
     },
   ],
+  evidenceSources: [
+    {
+      name: 'chat_message',
+      description: 'Сообщение из чата: text (обязательно), sender, sent_at.',
+      schema: {
+        type: 'object',
+        properties: { text: { type: 'string' }, sender: { type: 'string' }, sent_at: { type: 'string' } },
+        required: ['text'],
+      },
+      keep: ['text', 'sender', 'sent_at'],
+    },
+  ],
 };
 
 export const configSchema = {
   type: 'object',
-  properties: { timeAxes: { type: 'array' } },
+  properties: { timeAxes: { type: 'array' }, evidenceSources: { type: 'array' } },
   required: ['timeAxes'],
   additionalProperties: false,
 };
