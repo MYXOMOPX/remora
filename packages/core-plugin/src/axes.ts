@@ -37,6 +37,11 @@ function buildInteger(cfg: AxisConfig & { kind: 'integer' }): TimeAxisDef {
 }
 
 function buildDatetime(cfg: AxisConfig & { kind: 'datetime' }): TimeAxisDef {
+  if (cfg.unit !== 'seconds' && cfg.unit !== 'milliseconds') {
+    throw new RemoraError('invalid_config', `Шкала «${cfg.name}»: unit должен быть seconds или milliseconds`, {
+      axis: cfg.name, reason: 'bad unit',
+    });
+  }
   const factor = cfg.unit === 'seconds' ? 1000n : 1n;
   return {
     name: cfg.name,
@@ -64,9 +69,22 @@ function buildDatetime(cfg: AxisConfig & { kind: 'datetime' }): TimeAxisDef {
 
 function buildPacked(cfg: AxisConfig & { kind: 'packed' }): TimeAxisDef {
   const comps = cfg.components;
-  if (comps.length === 0) throw new RemoraError('invalid_config', `Шкала «${cfg.name}»: нужен хотя бы один компонент`);
+  const bad = (reason: string) =>
+    new RemoraError('invalid_config', `Шкала «${cfg.name}»: ${reason}`, { axis: cfg.name, reason });
+  if (!Array.isArray(comps)) throw bad('components должен быть массивом');
+  if (comps.length === 0) throw bad('нужен хотя бы один компонент');
+  const seen = new Set<string>();
+  for (const c of comps) {
+    if (typeof c !== 'object' || c === null || typeof c.name !== 'string' || c.name === '') {
+      throw bad('у компонента должно быть имя');
+    }
+    if (!Number.isSafeInteger(c.max) || c.max < 0) throw bad(`max компонента «${c.name}» должен быть целым числом >= 0`);
+    if (seen.has(c.name)) throw bad(`повторяющееся имя компонента «${c.name}»`);
+    seen.add(c.name);
+  }
   const radices = comps.map((c) => BigInt(c.max) + 1n);
   const names = comps.map((c) => c.name);
+  const total = radices.reduce((a, b) => a * b, 1n);
   const first = names[0]!;
   const listing = comps.map((c) => `${c.name} (0..${c.max})`).join(', ');
   const description =
@@ -96,10 +114,10 @@ function buildPacked(cfg: AxisConfig & { kind: 'packed' }): TimeAxisDef {
       for (const key of Object.keys(obj)) {
         if (!names.includes(key)) throw invalid(cfg.name, `неизвестный компонент «${key}»`);
       }
-      if (obj[first] === undefined) throw invalid(cfg.name, `обязателен компонент «${first}»`);
+      if (obj[first] == null) throw invalid(cfg.name, `обязателен компонент «${first}»`);
       let acc = 0n;
       comps.forEach((c, i) => {
-        const v = obj[c.name] ?? 0;
+        const v = obj[c.name] === undefined ? 0 : obj[c.name];
         if (typeof v !== 'number' || !Number.isSafeInteger(v) || v < 0 || v > c.max) {
           throw invalid(cfg.name, `компонент «${c.name}» должен быть целым числом от 0 до ${c.max}`);
         }
@@ -108,7 +126,6 @@ function buildPacked(cfg: AxisConfig & { kind: 'packed' }): TimeAxisDef {
       return acc;
     },
     decode(n) {
-      const total = radices.reduce((a, b) => a * b, 1n);
       if (n < 0n || n >= total) throw invalid(cfg.name, 'значение вне диапазона шкалы');
       const out: Record<string, number> = {};
       let rest = n;
@@ -127,5 +144,11 @@ export function buildAxis(cfg: AxisConfig): TimeAxisDef {
     case 'integer': return buildInteger(cfg);
     case 'datetime': return buildDatetime(cfg);
     case 'packed': return buildPacked(cfg);
+    default: {
+      const k = (cfg as { kind?: unknown } | null)?.kind;
+      throw new RemoraError('invalid_config', `Неизвестный вид шкалы: ${String(k)}`, {
+        axis: (cfg as { name?: unknown } | null)?.name, reason: 'unknown kind',
+      });
+    }
   }
 }

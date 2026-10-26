@@ -53,4 +53,20 @@ describe('core axes', () => {
     expect(story.valueSchema).toMatchObject({ type: 'object', required: ['tome'] });
     expect(story.description).toContain('старший компонент первым');
   });
+  it('rejects null components as invalid_time', () => {
+    for (const bad of [{ tome: null }, { tome: 1, chapter: null }])
+      expect(() => story.encode(bad)).toThrow(expect.objectContaining({ code: 'invalid_time' }));
+  });
+  it('rejects malformed axis configs with invalid_config', () => {
+    const cases: unknown[] = [
+      { name: 'a', kind: 'packed' },
+      { name: 'a', kind: 'packed', components: [{ name: 'x', max: 1.5 }] },
+      { name: 'a', kind: 'packed', components: [{ name: 'x', max: -1 }] },
+      { name: 'a', kind: 'nope' },
+      { name: 'a', kind: 'datetime', unit: 'days' },
+      { name: 'a', kind: 'packed', components: [{ name: 'x', max: 1 }, { name: 'x', max: 1 }] },
+    ];
+    for (const c of cases)
+      expect(() => buildAxis(c as never)).toThrow(expect.objectContaining({ code: 'invalid_config' }));
+  });
 });
