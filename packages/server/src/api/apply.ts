@@ -36,8 +36,16 @@ export function mapPgError(e: unknown): RemoraError | null {
 interface Env {
   db: Queryable;
   registry: PluginRegistry;
-  bindings: Map<string, Obj>;
+  bindings: Map<string, Binding>;
 }
+
+interface Binding {
+  op: string;
+  result: Obj;
+}
+
+/** Ops whose result carries an evidence `id`. Empty until plan 3 adds `add_evidence`. */
+const EVIDENCE_OPS: ReadonlySet<string> = new Set<string>();
 
 const DEFERRED = new Set(['add_evidence', 'add_event', 'update_event', 'retract_event']);
 
@@ -49,7 +57,8 @@ function unknownRef(ref: string): RemoraError {
 function entityArg(env: Env, o: Obj, key: string): string {
   const v = str(o, key);
   if (!v.startsWith('$')) return v;
-  const k = env.bindings.get(v.slice(1))?.key;
+  const b = env.bindings.get(v.slice(1));
+  const k = b?.op === 'create_entity' ? b.result.key : undefined;
   if (typeof k !== 'string') throw unknownRef(v);
   return k;
 }
@@ -63,15 +72,19 @@ async function evidenceArg(env: Env, o: Obj): Promise<bigint | undefined> {
   let id: number;
   if (typeof v === 'string') {
     if (!v.startsWith('$')) throw badType();
-    const bid = env.bindings.get(v.slice(1))?.id;
+    const b = env.bindings.get(v.slice(1));
+    const bid = b && EVIDENCE_OPS.has(b.op) ? b.result.id : undefined;
     if (typeof bid !== 'number') throw unknownRef(v);
     id = bid;
-  } else if (typeof v === 'number' && Number.isSafeInteger(v)) {
+  } else if (typeof v === 'number') {
     id = v;
   } else {
     throw badType();
   }
-  const r = id > 0 ? await env.db.query('SELECT 1 FROM evidence_log WHERE id = $1', [id]) : null;
+  const r =
+    Number.isSafeInteger(id) && id > 0
+      ? await env.db.query('SELECT 1 FROM evidence_log WHERE id = $1', [id])
+      : null;
   if (!r || r.rows.length === 0) {
     throw new RemoraError('unknown_ref', `unknown evidence ${id}`, { ref: id });
   }
@@ -191,6 +204,7 @@ const HANDLERS: Record<string, Handler> = {
 /** snake_case + JSON-number conversion of service results (bigint -> number). */
 function toApi(x: unknown): unknown {
   if (typeof x === 'bigint') return Number(x);
+  if (x instanceof Date) return x.toISOString();
   if (Array.isArray(x)) return x.map(toApi);
   if (isObj(x)) {
     const out: Obj = {};
@@ -208,10 +222,12 @@ function normaliseDetails(
   op: unknown,
   registry: PluginRegistry,
 ): Record<string, unknown> | undefined {
-  if (e.code !== 'invalid_time' || !e.details || !('from' in e.details || 'at' in e.details)) return e.details;
+  if (!e.details) return undefined;
+  if (e.code !== 'invalid_time' || !('from' in e.details || 'at' in e.details)) {
+    return toApi(e.details) as Record<string, unknown>;
+  }
   const { from, at, ...rest } = e.details;
-  const out: Record<string, unknown> = { ...rest };
-  if (typeof out.id === 'bigint') out.id = Number(out.id);
+  const out = toApi(rest) as Record<string, unknown>;
   const axisName = isObj(op) && isObj(op.time) ? op.time.axis : undefined;
   if (typeof axisName === 'string') {
     try {
@@ -233,6 +249,16 @@ function failure(index: number, e: RemoraError, op: unknown, registry: PluginReg
   return { ok: false, error };
 }
 
+/** Returns an Error when ROLLBACK failed, so the client (unknown tx state) is destroyed on release. */
+async function rollback(client: pg.PoolClient): Promise<Error | undefined> {
+  try {
+    await client.query('ROLLBACK');
+    return undefined;
+  } catch (e) {
+    return e instanceof Error ? e : new Error(String(e));
+  }
+}
+
 export async function apply(pool: pg.Pool, registry: PluginRegistry, request: unknown): Promise<ApplyResponse> {
   const invalid = (message: string): ApplyResponse => ({
     ok: false,
@@ -243,6 +269,7 @@ export async function apply(pool: pg.Pool, registry: PluginRegistry, request: un
   if (!Array.isArray(ops) || ops.length === 0) return invalid('ops must be a non-empty array');
 
   const client = await pool.connect();
+  let destroy: Error | undefined;
   try {
     await client.query('BEGIN');
     const env: Env = { db: client, registry, bindings: new Map() };
@@ -274,22 +301,22 @@ export async function apply(pool: pg.Pool, registry: PluginRegistry, request: un
         const result = toApi(await handler(env, op)) as Obj;
         if (as !== undefined) {
           result.as = as;
-          env.bindings.set(as, result);
+          env.bindings.set(as, { op: String(op.op), result });
         }
         results.push(result);
       } catch (e) {
         const mapped = e instanceof RemoraError ? e : mapPgError(e);
         if (!mapped) throw e;
-        await client.query('ROLLBACK');
+        destroy = await rollback(client);
         return failure(i, mapped, op, registry);
       }
     }
     await client.query('COMMIT');
     return { ok: true, results };
   } catch (e) {
-    await client.query('ROLLBACK').catch(() => undefined);
+    destroy = (await rollback(client)) ?? destroy;
     throw e;
   } finally {
-    client.release();
+    client.release(destroy);
   }
 }

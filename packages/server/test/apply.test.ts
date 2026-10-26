@@ -297,4 +297,87 @@ describe('apply', () => {
       expect(second[0]!.created).toBe(false);
     });
   });
+  describe('review fixes', () => {
+    it('$name bound to a non-evidence op is not evidence; non-create_entity is not an entity', async () => {
+      await withDb(async ({ run }) => {
+        const pt = { op: 'create_property_type', name: 'shoe', description: 'd', value_type: 'number', single_valued: true, as: 'p' };
+        expect(
+          errOf(await run(pt, { op: 'add_property', entity: 'bob', property: 'nickname', value: 'x', evidence: '$p' })),
+        ).toMatchObject({ op_index: 1, code: 'unknown_ref' });
+        expect(
+          errOf(await run(pt, { op: 'add_property', entity: '$p', property: 'nickname', value: 'x' })),
+        ).toMatchObject({ op_index: 1, code: 'unknown_ref' });
+      });
+    });
+
+    it('numeric evidence: non-integer / <=0 / absent -> unknown_ref; other types -> invalid_param', async () => {
+      await withDb(async ({ run }) => {
+        const base = { op: 'add_property', entity: 'bob', property: 'nickname', value: 'x' };
+        for (const evidence of [1.5, 0, -3, 999]) {
+          expect(errOf(await run({ ...base, evidence }))).toMatchObject({ code: 'unknown_ref' });
+        }
+        for (const evidence of [true, {}, null, []]) {
+          expect(errOf(await run({ ...base, evidence }))).toMatchObject({ code: 'invalid_param' });
+        }
+      });
+    });
+
+    it('error details are snake_case', async () => {
+      await withDb(async ({ run }) => {
+        const e = errOf(await run({ op: 'add_property', entity: 'bob', property: 'height', value: 'tall' }));
+        expect(e.code).toBe('value_type_mismatch');
+        expect(e.details).toBeDefined();
+        expect(Object.keys(e.details!).every((k) => !/[A-Z]/.test(k))).toBe(true);
+        expect(e.details).toHaveProperty('value_type');
+      });
+    });
+
+    it('a mapped DB-level conflict rolls back earlier ops', async () => {
+      await withDb(async ({ pool, run }) => {
+        const e = errOf(
+          await run(
+            { op: 'create_entity', key: 'y' },
+            { op: 'add_property', entity: 'y', property: 'job_title', value: 'A' },
+            { op: 'add_property', entity: 'y', property: 'job_title', value: 'B' },
+          ),
+        );
+        expect(e).toMatchObject({ op_index: 2, code: 'single_valued_conflict' });
+        expect((await pool.query("SELECT 1 FROM entity WHERE key = 'y'")).rows).toHaveLength(0);
+      });
+    });
+
+    function stubPool(failOn: (sql: string) => unknown) {
+      const calls: string[] = [];
+      const released: unknown[] = [];
+      const client = {
+        query: (sql: string) => {
+          calls.push(sql);
+          const err = failOn(sql);
+          return err ? Promise.reject(err) : Promise.resolve({ rows: [], rowCount: 0 });
+        },
+        release: (err?: unknown) => released.push(err),
+      };
+      return { pool: { connect: async () => client } as unknown as pg.Pool, calls, released };
+    }
+
+    it('pg error mapped via mapPgError -> concurrent_update, ROLLBACK issued', async () => {
+      await withDb(async ({ reg }) => {
+        const s = stubPool((sql) => (sql.includes('INSERT INTO entity') ? { code: '40P01' } : null));
+        const r = await apply(s.pool, reg, { ops: [{ op: 'create_entity', key: 'z' }] });
+        expect(errOf(r)).toMatchObject({ op_index: 0, code: 'concurrent_update' });
+        expect(s.calls).toContain('ROLLBACK');
+        expect(s.released).toEqual([undefined]);
+      });
+    });
+
+    it('failed ROLLBACK destroys the client but keeps the original error', async () => {
+      await withDb(async ({ reg }) => {
+        const boom = new Error('rollback failed');
+        const s = stubPool((sql) => (sql === 'ROLLBACK' ? boom : null));
+        const r = await apply(s.pool, reg, { ops: [{ op: 'frobnicate' }] });
+        expect(errOf(r)).toMatchObject({ op_index: 0, code: 'invalid_param' });
+        expect(s.released).toEqual([boom]);
+      });
+    });
+  });
 });
