@@ -283,6 +283,9 @@ describe('plugin registry', () => {
       'evidenceSources not an array': () => ({ evidenceSources: {} }),
       'source without description': () => ({ evidenceSources: [{ ...goodSource, description: undefined }] }),
       'source with bad payloadSchema': () => ({ evidenceSources: [{ ...goodSource, payloadSchema: null }] }),
+      'source with uncompilable payloadSchema': () => ({
+        evidenceSources: [{ ...goodSource, payloadSchema: { type: 'nope' } }],
+      }),
       'source without ingest': () => ({ evidenceSources: [{ ...goodSource, ingest: undefined }] }),
       'source without planRetention': () => ({ evidenceSources: [{ ...goodSource, planRetention: undefined }] }),
       'async setup (Promise)': () => Promise.resolve({ timeAxes: [goodAxis] }),
@@ -341,6 +344,68 @@ describe('plugin registry', () => {
       });
       expect(reg.status()).toEqual([{ name: 'badschema', ok: false, error: expect.any(String) }]);
       expect(() => reg.getAxis('broken')).toThrow(code('axis_unavailable'));
+    });
+  });
+
+  describe('evidence source lookup', () => {
+    const src = (name: string, over: Record<string, unknown> = {}) => ({
+      name, description: 'd', payloadSchema: { type: 'object' },
+      ingest: (payload: unknown) => ({ payload }), planRetention: () => [], ...over,
+    });
+    const withSources = (name: string, sources: unknown[]) =>
+      plug(name, [], { setup: () => ({ evidenceSources: sources as never }) });
+
+    it('getSource / listSources return served sources', async () => {
+      await withDb(async (pool) => {
+        await insertPlugin(pool, 'fake-a');
+        const reg = await loadPlugins(pool, { importer: importerOf({ 'fake-a': withSources('fake-a', [src('chat')]) }) });
+        const row = await pool.query<{ id: number }>(`SELECT id FROM evidence_source WHERE name = 'chat'`);
+        const s = reg.getSource('chat');
+        expect(s.name).toBe('chat');
+        expect(s.id).toBe(row.rows[0]!.id);
+        expect(s.def.ingest({ a: 1 })).toEqual({ payload: { a: 1 } });
+        expect(reg.listSources().map((x) => x.name)).toEqual(['chat']);
+        expect(() => reg.getSource('nope')).toThrow(code('unknown_source'));
+      });
+    });
+
+    it('a source of a failed plugin is source_unavailable', async () => {
+      await withDb(async (pool) => {
+        const id = await insertPlugin(pool, 'bad');
+        await pool.query(
+          `INSERT INTO evidence_source (name, plugin_id, description, payload_schema) VALUES ('bad_src', $1, 'x', '{}')`,
+          [id],
+        );
+        const bad = plug('bad', [], { setup: () => { throw new Error('boom'); } });
+        const reg = await loadPlugins(pool, {
+          importer: importerOf({ bad }),
+          logger: { warn: vi.fn(), error: vi.fn() },
+        });
+        expect(() => reg.getSource('bad_src')).toThrow(code('source_unavailable'));
+        expect(reg.listSources()).toEqual([]);
+      });
+    });
+
+    it('a source no longer declared is source_unavailable', async () => {
+      await withDb(async (pool) => {
+        await insertPlugin(pool, 'fake-a');
+        await loadPlugins(pool, { importer: importerOf({ 'fake-a': withSources('fake-a', [src('old_src')]) }) });
+        const reg = await loadPlugins(pool, { importer: importerOf({ 'fake-a': withSources('fake-a', []) }) });
+        expect(() => reg.getSource('old_src')).toThrow(code('source_unavailable'));
+      });
+    });
+
+    it('an uncompilable payloadSchema degrades the plugin with invalid_plugin', async () => {
+      await withDb(async (pool) => {
+        await insertPlugin(pool, 'fake-a');
+        const reg = await loadPlugins(pool, {
+          importer: importerOf({ 'fake-a': withSources('fake-a', [src('s', { payloadSchema: { type: 'nope' } })]) }),
+          logger: { warn: vi.fn(), error: vi.fn() },
+        });
+        expect(reg.status()).toEqual([
+          { name: 'fake-a', ok: false, error: expect.stringContaining('invalid_plugin') },
+        ]);
+      });
     });
   });
 });

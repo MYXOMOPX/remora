@@ -21,9 +21,17 @@ export const CORE_PLUGIN_NAME = 'remora-core';
 
 export type AxisInfo = AxisRef;
 
+export interface SourceInfo {
+  id: number;
+  name: string;
+  def: EvidenceSourceDef;
+}
+
 export interface PluginRegistry {
   getAxis(name: string): AxisInfo;
   getAxisById(id: number): AxisInfo;
+  getSource(name: string): SourceInfo;
+  listSources(): SourceInfo[];
   status(): { name: string; ok: boolean; error?: string }[];
 }
 
@@ -104,6 +112,11 @@ function validateSetupResult(raw: unknown, plugin: string): ReturnType<PluginDef
       if (!nonEmpty(s.name)) throw bad(`${at}.name must be a non-empty string`);
       if (!nonEmpty(s.description)) throw bad(`${at}.description must be a non-empty string`);
       if (!isObject(s.payloadSchema)) throw bad(`${at}.payloadSchema must be an object`);
+      try {
+        compileCached(s.payloadSchema);
+      } catch (e) {
+        throw bad(`${at}.payloadSchema is not a valid JSON Schema: ${errMsg(e)}`);
+      }
       if (typeof s.ingest !== 'function') throw bad(`${at}.ingest must be a function`);
       if (typeof s.planRetention !== 'function') throw bad(`${at}.planRetention must be a function`);
     });
@@ -155,6 +168,7 @@ export async function loadPlugins(
   const statuses: { name: string; ok: boolean; error?: string }[] = [];
   const axes = new Map<string, AxisInfo>();
   const unavailableAxes = new Map<string, string>();
+  const sources = new Map<string, SourceInfo>();
 
   for (const p of plugins) {
     let setupResult: ReturnType<PluginDef['setup']>;
@@ -196,14 +210,16 @@ export async function loadPlugins(
     }
     for (const s of setupResult.evidenceSources ?? ([] as EvidenceSourceDef[])) {
       await assertNameFree(db, 'evidence_source', s.name, p.id);
-      await db.query(
+      const r = await db.query<{ id: number }>(
         `INSERT INTO evidence_source (name, plugin_id, description, payload_schema)
          VALUES ($1, $2, $3, $4::jsonb)
          ON CONFLICT (name) DO UPDATE SET
            description = EXCLUDED.description,
-           payload_schema = EXCLUDED.payload_schema`,
+           payload_schema = EXCLUDED.payload_schema
+         RETURNING id`,
         [s.name, p.id, s.description, JSON.stringify(s.payloadSchema)],
       );
+      sources.set(s.name, { id: r.rows[0]!.id, name: s.name, def: s });
     }
     statuses.push({ name: p.name, ok: true });
   }
@@ -214,7 +230,23 @@ export async function loadPlugins(
   const { rows: allAxes } = await db.query<{ id: number; name: string }>('SELECT id, name FROM time_axis');
   for (const r of allAxes) if (!axesById.has(r.id)) unavailableIds.set(r.id, r.name);
 
+  const unavailableSources = new Set<string>();
+  const { rows: allSources } = await db.query<{ id: number; name: string }>(
+    'SELECT id, name FROM evidence_source',
+  );
+  for (const r of allSources) if (!sources.has(r.name)) unavailableSources.add(r.name);
+  const sourceList = [...sources.values()].sort((a, b) => a.id - b.id);
+
   return {
+    getSource(name) {
+      const hit = sources.get(name);
+      if (hit) return hit;
+      if (unavailableSources.has(name)) {
+        throw new RemoraError('source_unavailable', `evidence source ${name} is not served by a loaded plugin`);
+      }
+      throw new RemoraError('unknown_source', `unknown evidence source ${name}`);
+    },
+    listSources: () => [...sourceList],
     getAxisById(id) {
       const hit = axesById.get(id);
       if (hit) return hit;
