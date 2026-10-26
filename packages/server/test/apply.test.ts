@@ -389,4 +389,21 @@ describe('apply', () => {
       });
     });
   });
+
+  it('NUL characters in values and keys are invalid_param, not raw DB errors', async () => {
+    await withDb(async ({ run }) => {
+      expect(
+        errOf(await run({ op: 'add_property', entity: 'bob', property: 'nickname', value: 'a b' })),
+      ).toMatchObject({ op_index: 0, code: 'invalid_param' });
+      expect(errOf(await run({ op: 'create_entity', key: 'a b' }))).toMatchObject({
+        op_index: 0,
+        code: 'invalid_param',
+      });
+    });
+  });
+
+  it('mapPgError maps SQLSTATE class 22 to invalid_param', () => {
+    expect(mapPgError({ code: '22P05' })?.code).toBe('invalid_param');
+    expect(mapPgError({ code: '22021' })?.code).toBe('invalid_param');
+  });
 });

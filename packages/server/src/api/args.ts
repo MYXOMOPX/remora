@@ -49,12 +49,6 @@ export function int(o: Obj, key: string): number {
   return v;
 }
 
-export function obj(o: Obj, key: string): Obj {
-  const v = o[key];
-  if (!isObj(v)) throw bad(key, 'an object (required)');
-  return v;
-}
-
 export function optStrArr(o: Obj, key: string): string[] | undefined {
   const v = o[key];
   if (v === undefined) return undefined;

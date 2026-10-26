@@ -171,8 +171,7 @@ export async function relationHistory(
       JOIN entity es ON es.entity_id = r.src
       JOIN entity ed ON ed.entity_id = r.dst
      WHERE ${where}`;
-  const [rows, count] = await Promise.all([
-    db.query<RawRelationRow>(
+  const rows = await db.query<RawRelationRow>(
       `SELECT r.id, r.relation_id, rt.name AS type, es.key AS src_key, ed.key AS dst_key,
               r.time_axis, lower(r.time_span)::text AS lo, upper(r.time_span)::text AS hi,
               r.evidence_id, r.recorded_at, r.retracted_at
@@ -180,9 +179,8 @@ export async function relationHistory(
        ORDER BY r.relation_id, r.id
        LIMIT $${params.length + 1}`,
       [...params, limit],
-    ),
-    db.query<{ n: string }>(`SELECT count(*) AS n ${from}`, params),
-  ]);
+    );
+  const count = await db.query<{ n: string }>(`SELECT count(*) AS n ${from}`, params);
   const total = Number(count.rows[0]!.n);
   return {
     rows: rows.rows.map((x) => ({

@@ -234,4 +234,26 @@ describe('query', () => {
       expect(err(await q({ op: 'create_entity', key: 'x' })).code).toBe('invalid_param');
     });
   });
+
+  it('find_entities with a NUL in the query -> invalid_param', async () => {
+    await withDb(async ({ q }) => {
+      expect(err(await q({ op: 'find_entities', query: 'a b' })).code).toBe('invalid_param');
+    });
+  });
+
+  it('relation_history limit reports total and truncated', async () => {
+    await withDb(async ({ write, q }) => {
+      await write(
+        { op: 'create_entity', key: 'google' },
+        { op: 'create_relation_type', name: 'works_at', description: 'Employment.', directed: true },
+        { op: 'add_relation', type: 'works_at', from: 'bob', to: 'google' },
+        { op: 'add_relation', type: 'works_at', from: 'bob', to: 'google' },
+        { op: 'add_relation', type: 'works_at', from: 'bob', to: 'google' },
+      );
+      const [h] = ok(await q({ op: 'relation_history', entity: 'bob', limit: 2 }));
+      expect(h!.rows).toHaveLength(2);
+      expect(h!.total).toBe(3);
+      expect(h!.truncated).toBe(true);
+    });
+  });
 });

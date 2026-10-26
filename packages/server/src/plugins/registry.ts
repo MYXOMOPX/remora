@@ -7,6 +7,8 @@ import {
   type TimeAxisDef,
 } from '@remora/sdk';
 import type { Queryable } from '../db/types.js';
+import { compileCached } from '../services/ajv.js';
+import type { AxisRef } from '../services/time.js';
 
 export type Importer = (spec: string) => Promise<unknown>;
 
@@ -17,11 +19,7 @@ export interface Logger {
 
 export const CORE_PLUGIN_NAME = 'remora-core';
 
-export interface AxisInfo {
-  id: number;
-  name: string;
-  def: TimeAxisDef;
-}
+export type AxisInfo = AxisRef;
 
 export interface PluginRegistry {
   getAxis(name: string): AxisInfo;
@@ -88,6 +86,11 @@ function validateSetupResult(raw: unknown, plugin: string): ReturnType<PluginDef
       if (!nonEmpty(a.name)) throw bad(`${at}.name must be a non-empty string`);
       if (!nonEmpty(a.description)) throw bad(`${at}.description must be a non-empty string`);
       if (!isObject(a.valueSchema)) throw bad(`${at}.valueSchema must be an object`);
+      try {
+        compileCached(a.valueSchema);
+      } catch (e) {
+        throw bad(`${at}.valueSchema is not a valid JSON Schema: ${errMsg(e)}`);
+      }
       if (a.example === undefined) throw bad(`${at}.example must be defined`);
       if (typeof a.encode !== 'function') throw bad(`${at}.encode must be a function`);
       if (typeof a.decode !== 'function') throw bad(`${at}.decode must be a function`);

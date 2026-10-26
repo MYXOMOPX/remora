@@ -11,11 +11,12 @@ const importer: Importer = async (spec) => {
 
 async function withApp(fn: (app: RemoraApp) => Promise<void>): Promise<void> {
   const { url, drop } = await createTestDb();
-  const app = await startRemora({ databaseUrl: url, importer });
+  let app: RemoraApp | undefined;
   try {
+    app = await startRemora({ databaseUrl: url, importer });
     await fn(app);
   } finally {
-    await app.close();
+    await app?.close();
     await drop();
   }
 }

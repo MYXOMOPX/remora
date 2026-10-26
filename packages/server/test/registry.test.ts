@@ -323,4 +323,24 @@ describe('plugin registry', () => {
       });
     }
   });
+
+  it('a non-core plugin with a malformed axis valueSchema is degraded (axis_unavailable)', async () => {
+    await withDb(async (pool) => {
+      const id = await insertPlugin(pool, 'badschema');
+      await pool.query(
+        `INSERT INTO time_axis (name, plugin_id, description, value_schema, example)
+         VALUES ('broken', $1, 'x', '{"type":"integer"}', '1')`,
+        [id],
+      );
+      const broken = plug('badschema', [], {
+        setup: () => ({ timeAxes: [{ ...axis('broken'), valueSchema: { type: 'nonsense' } }] }),
+      });
+      const reg = await loadPlugins(pool, {
+        importer: importerOf({ badschema: broken }),
+        logger: { warn: vi.fn(), error: vi.fn() },
+      });
+      expect(reg.status()).toEqual([{ name: 'badschema', ok: false, error: expect.any(String) }]);
+      expect(() => reg.getAxis('broken')).toThrow(code('axis_unavailable'));
+    });
+  });
 });

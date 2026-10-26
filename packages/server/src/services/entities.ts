@@ -54,13 +54,12 @@ export async function findEntities(
   }
   const limit = clampLimit(args.limit);
   const where = patterns.map((_, i) => `key ILIKE $${i + 1}`).join(' AND ');
-  const [rows, count] = await Promise.all([
-    db.query<RawEntity>(
-      `SELECT entity_id, key FROM entity WHERE ${where} ORDER BY key LIMIT $${patterns.length + 1}`,
-      [...patterns, limit],
-    ),
-    db.query<{ n: string }>(`SELECT count(*) AS n FROM entity WHERE ${where}`, patterns),
-  ]);
+  // Sequential: one client must not have two queries in flight (pg deprecation).
+  const rows = await db.query<RawEntity>(
+    `SELECT entity_id, key FROM entity WHERE ${where} ORDER BY key LIMIT $${patterns.length + 1}`,
+    [...patterns, limit],
+  );
+  const count = await db.query<{ n: string }>(`SELECT count(*) AS n FROM entity WHERE ${where}`, patterns);
   const total = Number(count.rows[0]!.n);
   return { rows: rows.rows.map(toRow), total, truncated: total > rows.rows.length };
 }
