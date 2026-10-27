@@ -24,7 +24,11 @@ export interface PluginListRow {
   sources: string[];
 }
 
-/** R40 list_plugins: `pending_restart` = a row this process did not load at start. */
+/**
+ * R40 list_plugins: `pending_restart` = a row whose name this process did not load at start.
+ * Matching is by name only: a plugin removed and re-added under the same name between restarts,
+ * or one whose config was changed, still shows its loaded status until the restart.
+ */
 export async function listPlugins(db: Queryable, registry: PluginRegistry): Promise<PluginListRow[]> {
   const status = new Map(registry.status().map((s) => [s.name, s]));
   const { rows } = await db.query<{
@@ -61,7 +65,12 @@ interface PluginRow {
   name: string;
 }
 
-/** Axes and sources of a plugin that hold data (property/relation/event times; evidence rows). */
+/**
+ * Axes and sources of a plugin that hold data (property/relation/event times; evidence rows).
+ * Cost: property_version, relation and evidence_log have no index leading with time_axis /
+ * source_id, so a plugin without data costs a sequential scan of those tables. This runs only
+ * for operator calls; add indexes if it ever matters.
+ */
 async function ownedWithData(
   db: Queryable,
   pluginId: number,
@@ -119,7 +128,8 @@ export async function setPluginConfig(
   checkConfig(def, a.config, `config of ${row.name}`);
   const setup = (() => {
     try {
-      return validateSetupResult(def.setup(a.config), row.name);
+      // a copy: setup() must not be able to alter the config that is stored
+      return validateSetupResult(def.setup(structuredClone(a.config)), row.name);
     } catch (e) {
       if (e instanceof RemoraError) throw e;
       throw new RemoraError('invalid_config', `setup of ${row.name} rejected the config: ${errMsg(e)}`);
@@ -137,7 +147,8 @@ export async function setPluginConfig(
       { reason: 'confirm_required', affected: { axes: data.axes, sources: data.sources } },
     );
   }
-  await db.query('UPDATE plugin SET config = $2::jsonb WHERE id = $1', [row.id, JSON.stringify(a.config)]);
+  const upd = await db.query('UPDATE plugin SET config = $2::jsonb WHERE id = $1', [row.id, JSON.stringify(a.config)]);
+  if (upd.rowCount === 0) throw new RemoraError('not_found', `plugin ${a.name} not found`);
   return { name: row.name, restartRequired: true };
 }
 
@@ -167,6 +178,10 @@ export async function removePlugin(pool: pg.Pool, name: string): Promise<{ name:
   } catch (e) {
     destroy = await rollback(client);
     if (e instanceof RemoraError) throw e;
+    // a row written concurrently after the data check: still a has_data refusal
+    if ((e as { code?: unknown } | null)?.code === '23503') {
+      throw new RemoraError('invalid_param', `plugin ${name} owns data and cannot be removed`, { reason: 'has_data' });
+    }
     throw mapPgError(e) ?? e;
   } finally {
     client.release(destroy);

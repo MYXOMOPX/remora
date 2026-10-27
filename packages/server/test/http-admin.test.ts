@@ -175,6 +175,12 @@ describe('admin routes: evidence maintenance', () => {
       ['purge_evidence', { source: 'chat_message', older_than: 'nope' }],
       ['purge_evidence', { source: 'chat_message', older_than: 5 }],
       ['purge_evidence', { source: 'chat_message', older_than: '2020-13-45' }],
+      ['purge_evidence', { source: 'chat_message', older_than: '2020-01-01T10:00' }],
+      ['purge_evidence', { source: 'chat_message', older_than: '2020-01-01 10:00' }],
+      ['purge_evidence', { source: 'chat_message', older_than: '2020-01-01T10:00:00' }],
+      ['purge_evidence', { source: 'bad\nname', older_than: '2020-01-01' }],
+      ['apply_retention', { source: 'bad\nname' }],
+      ['apply_retention', { source: '' }],
       ['purge_evidence', {}],
       ['purge_evidence', { ids: [] }],
       ['purge_evidence', { ids: [1.5] }],
@@ -219,10 +225,26 @@ describe('admin routes: evidence maintenance', () => {
     expect(proto.status).toBe(400);
     expect(proto.json().error.code).toBe('invalid_param');
     const ctor = await admin(e, 'set_plugin_config', { name: 'remora-core', config: { a: { constructor: 1 } } });
+    // only `__proto__` is refused here; the plugin's own schema still judges the rest
     expect(ctor.status).toBe(400);
+    expect(ctor.json().error.code).toBe('invalid_config');
     const nested = await raw(e.port, 'POST', `/${ADMIN}/admin/pin_evidence`, '{"id":1,"__proto__":{"a":1}}');
     expect(nested.status).toBe(400);
     expect((await admin(e, 'pin_evidence', { id: 999999 })).status).toBe(404);
+  });
+});
+
+describe('admin routes: older_than time zones', () => {
+  it('accepts date-only (UTC), Z and offset forms and reads them as such', async () => {
+    const e = await setup();
+    const id = await addEvidence(e);
+    await e.app.pool.query(`UPDATE evidence_log SET created_at = '2020-06-01T12:00:00Z' WHERE id = $1`, [id]);
+    const purge = (older_than: string) => admin(e, 'purge_evidence', { source: 'chat_message', older_than });
+    // 12:00Z is before 15:00+02:00 (= 13:00Z)? yes, but not before 13:00+02:00 (= 11:00Z)
+    expect((await purge('2020-06-01T13:00:00+02:00')).json().result.purged).toBe(0);
+    expect((await purge('2020-06-01')).json().result.purged).toBe(0);
+    expect((await purge('2020-06-01T12:00:00Z')).json().result.purged).toBe(0);
+    expect((await purge('2020-06-01T15:00:00+02:00')).json().result.purged).toBe(1);
   });
 });
 

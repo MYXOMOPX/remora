@@ -3,7 +3,7 @@ import { definePlugin, type PluginDef } from '@remora/sdk';
 import { describe, expect, it } from 'vitest';
 import { startRemora, type RemoraApp } from '../src/app.js';
 import type { Importer } from '../src/plugins/registry.js';
-import { intAxis } from './helpers/axes.js';
+import { fakeSource, intAxis } from './helpers/axes.js';
 import { createTestDb } from './helpers/testDb.js';
 
 const p2 = definePlugin<{ n: number }>({
@@ -13,7 +13,13 @@ const p2 = definePlugin<{ n: number }>({
   setup: () => ({ timeAxes: [intAxis('p2_day')] }),
 });
 
-const mods: Record<string, unknown> = { '@remora/core-plugin': corePlugin, p2 };
+const p4 = definePlugin<{ n: number }>({
+  ...p2,
+  name: 'p4',
+  setup: () => ({ evidenceSources: [fakeSource('p4_src')] }),
+});
+
+const mods: Record<string, unknown> = { '@remora/core-plugin': corePlugin, p2, p4 };
 const importer: Importer = async (spec) => {
   if (spec in mods) return mods[spec];
   throw new Error(`cannot import ${spec}`);
@@ -89,7 +95,7 @@ describe('setPluginConfig', () => {
       expect((await fail(app.setPluginConfig({ name: 'remora-core', config: { timeAxes: 5 } }))).code).toBe('invalid_config');
       expect((await fail(app.setPluginConfig({ name: 'nope', config: {} }))).code).toBe('not_found');
       const e = await fail(app.setPluginConfig({ name: 'remora-core', config: { timeAxes: [{ nope: 1 }] } }));
-      expect(['invalid_config', 'invalid_plugin']).toContain(e.code);
+      expect(e.code).toBe('invalid_config');
       const { rows } = await app.pool.query(`SELECT config FROM plugin WHERE name = 'remora-core'`);
       expect(rows[0].config.timeAxes).toHaveLength(3);
     });
@@ -166,6 +172,58 @@ describe('removePlugin', () => {
                 (SELECT count(*) FROM time_axis WHERE name = 'p2_day')::int AS a`,
       );
       expect(left.rows[0]).toEqual({ p: 0, a: 0 });
+    });
+  });
+});
+
+describe('plugins with evidence sources', () => {
+  async function withP4(fn: (app: RemoraApp) => Promise<void>): Promise<void> {
+    await withApp(async (app, url) => {
+      await app.addPlugin({ package: 'p4' });
+      const again = await startRemora({ databaseUrl: url, importer });
+      try {
+        await fn(again);
+      } finally {
+        await again.close();
+      }
+    });
+  }
+  const addRow = (app: RemoraApp) =>
+    app.apply({ ops: [{ op: 'add_evidence', source: 'p4_src', payload: { text: 'hi' } }] });
+
+  it('an evidence row makes set_plugin_config need confirmation and blocks removal', async () => {
+    await withP4(async (app) => {
+      expect((await addRow(app)).ok).toBe(true);
+      const e = await fail(app.setPluginConfig({ name: 'p4', config: { n: 2 } }));
+      expect(e.details.reason).toBe('confirm_required');
+      expect(e.details.affected).toEqual({ axes: [], sources: ['p4_src'] });
+      const r = await fail(app.removePlugin('p4'));
+      expect(r.details.reason).toBe('has_data');
+      expect(r.details.sources).toEqual(['p4_src']);
+    });
+  });
+
+  it('removal deletes the plugin, its sources and axes when there is no data', async () => {
+    await withP4(async (app) => {
+      expect(await app.removePlugin('p4')).toEqual({ name: 'p4', restartRequired: true });
+      const left = await app.pool.query(
+        `SELECT (SELECT count(*) FROM plugin WHERE name = 'p4')::int AS p,
+                (SELECT count(*) FROM evidence_source WHERE name = 'p4_src')::int AS s`,
+      );
+      expect(left.rows[0]).toEqual({ p: 0, s: 0 });
+    });
+  });
+
+  it('setup cannot alter the stored config', async () => {
+    await withP4(async (app) => {
+      mods.p4 = { ...p4, setup: (c: { n: number }) => { c.n = 99; return {}; } };
+      try {
+        await app.setPluginConfig({ name: 'p4', config: { n: 3 } });
+      } finally {
+        mods.p4 = p4;
+      }
+      const { rows } = await app.pool.query(`SELECT config FROM plugin WHERE name = 'p4'`);
+      expect(rows[0].config).toEqual({ n: 3 });
     });
   });
 });

@@ -11,7 +11,6 @@ const MAX_NAME = 200;
 const MAX_PACKAGE = 512;
 const MAX_IDS = 10_000;
 const MAX_CONFIG_DEPTH = 64;
-const FORBIDDEN_KEYS: ReadonlySet<string> = new Set(['__proto__', 'constructor', 'prototype']);
 
 type Handler = (app: RemoraApp, body: Obj) => Promise<unknown>;
 
@@ -54,18 +53,20 @@ function checkJson(v: unknown, field: string, depth = 0): void {
     for (const x of v) checkJson(x, field, depth + 1);
   } else if (typeof v === 'object' && v !== null) {
     for (const [k, x] of Object.entries(v)) {
-      if (FORBIDDEN_KEYS.has(k)) throw bad(field, `free of the key ${k}`);
+      // JSON.parse makes `__proto__` an own key; plugins may legitimately use `constructor`/`prototype`
+      if (k === '__proto__') throw bad(field, 'free of the key __proto__');
       checkJson(x, field, depth + 1);
     }
   }
 }
 
-const ISO = /^(\d{4})-(\d{2})-(\d{2})(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
+const ISO = /^(\d{4})-(\d{2})-(\d{2})(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,9})?)?(?:Z|[+-]\d{2}:\d{2}))?$/;
 
 function isoDate(v: unknown, key: string): Date {
   const m = typeof v === 'string' ? ISO.exec(v) : null;
   if (m === null) throw bad(key, 'an ISO-8601 date or date-time string');
-  const d = new Date(v as string);
+  // a time part must carry Z or an offset (purge is destructive: no server-local guessing); date-only is UTC
+  const d = new Date((v as string).replace(' ', 'T'));
   const day = new Date(Date.UTC(+m[1]!, +m[2]! - 1, +m[3]!));
   if (
     Number.isNaN(d.getTime()) ||
@@ -108,8 +109,7 @@ const HANDLERS: Record<string, Handler> = {
   },
   async apply_retention(app, body) {
     only(body, ['source', 'batch_size']);
-    const source = optStr(body, 'source');
-    if (source !== undefined && (source === '' || source.length > MAX_NAME)) throw bad('source', 'a non-empty string');
+    const source = body.source === undefined ? undefined : name(body, 'source');
     const batchSize = optInt(body, 'batch_size');
     const r = await app.applyRetention({
       ...(source !== undefined ? { source } : {}),
