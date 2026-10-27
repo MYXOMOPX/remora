@@ -6,6 +6,7 @@ import type { ApiError } from '../api/apply.js';
 import type { RemoraApp } from '../app.js';
 import { getContract } from '../contract/index.js';
 import type { JsonLogger } from '../log.js';
+import { handleMcp } from '../mcp/server.js';
 import { runApply, runQuery } from '../transport/dispatch.js';
 import { HttpError, readJsonBody } from './body.js';
 import { isValidSecret, secretMatches } from './secret.js';
@@ -38,7 +39,7 @@ interface Ctx {
   close: boolean;
 }
 
-/** A route below `/<secret>/`. Tasks 7 and 8 add `mcp` and `admin` to the table. */
+/** A route below `/<secret>/`. Task 8 adds `admin` to the table. */
 interface Route {
   method: string;
   label: string;
@@ -166,6 +167,20 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
           if (ops !== undefined) ctx.ops = ops;
           const r = await runQuery(app, body);
           send(ctx, envelopeStatus(r), r);
+        },
+      },
+    ],
+    [
+      'mcp',
+      {
+        method: 'POST',
+        label: '/:secret/mcp',
+        async handle(ctx, o) {
+          // same body limit, content-type check and slow-body timer as the JSON routes
+          const body = await readJsonBody(ctx.req, o.maxBodyBytes, bodyTimeoutMs);
+          await handleMcp(app, ctx.req, ctx.res, body, {
+            onError: (e) => logger.error('mcp error', { request_id: ctx.requestId, error: e instanceof Error ? e.name : typeof e }),
+          });
         },
       },
     ],
