@@ -13,17 +13,19 @@ import { formatTime, type AxisRef, type TimeOut, type When } from './time.js';
 export function whenClause(
   when: When | undefined,
   firstParam: number,
+  alias?: string,
 ): { sql: string; params: unknown[] } {
   if (when === undefined) return { sql: 'true', params: [] };
   const n = firstParam;
+  const c = alias === undefined ? '' : `${alias}.`;
   if ('at' in when) {
     return {
-      sql: `(time_axis IS NULL OR (time_axis = $${n} AND time_span @> $${n + 1}::bigint))`,
+      sql: `(${c}time_axis IS NULL OR (${c}time_axis = $${n} AND ${c}time_span @> $${n + 1}::bigint))`,
       params: [when.axis.id, when.at],
     };
   }
   return {
-    sql: `(time_axis IS NULL OR (time_axis = $${n} AND time_span && int8range($${n + 1}, $${n + 2}, '[)')))`,
+    sql: `(${c}time_axis IS NULL OR (${c}time_axis = $${n} AND ${c}time_span && int8range($${n + 1}, $${n + 2}, '[)')))`,
     params: [when.axis.id, when.from, when.to],
   };
 }

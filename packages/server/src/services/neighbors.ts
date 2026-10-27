@@ -224,7 +224,7 @@ export async function neighbors(
   const byId = new Map(page.rows.map((r, i) => [r.entity_id, rows[i]!]));
 
   // 3. via + via_count per page entity.
-  const vw = whenClause(a.when, 7);
+  const vw = whenClause(a.when, 7, 'rel');
   const via = a.paths ? { rows: [] } : await db.query<{
     entity_id: string;
     type: string;
@@ -235,25 +235,29 @@ export async function neighbors(
     hi: string | null;
     cnt: string;
   }>(
-    `SELECT t.entity_id, rt.name AS type, pe.key AS pred_key, r.relation_id,
-            r.time_axis, lower(r.time_span)::text AS lo, upper(r.time_span)::text AS hi, v.cnt
-       FROM unnest($1::bigint[], $2::int[]) t(entity_id, depth)
-      CROSS JOIN LATERAL (
-        SELECT (array_agg(x.id ORDER BY x.relation_id, x.id))[1] AS rel_pk,
-               (array_agg(x.pred ORDER BY x.relation_id, x.id))[1] AS pred,
-               count(DISTINCT x.relation_id) AS cnt
-          FROM (
-            SELECT rel.id, rel.relation_id, pl.entity_id AS pred
-              FROM unnest($3::bigint[], $4::int[]) pl(entity_id, depth)
-              JOIN relation rel
-                ON (rel.src = pl.entity_id AND rel.dst = t.entity_id AND rel.relation_type_id = ANY($5::smallint[]))
-                OR (rel.dst = pl.entity_id AND rel.src = t.entity_id AND rel.relation_type_id = ANY($6::smallint[]))
-             WHERE pl.depth = t.depth - 1 AND rel.retracted_at IS NULL AND ${vw.sql}
-          ) x
-      ) v
-      JOIN relation r ON r.id = v.rel_pk
-      JOIN relation_type rt ON rt.id = r.relation_type_id
-      JOIN entity pe ON pe.entity_id = v.pred`,
+    `WITH t(entity_id, depth) AS (SELECT * FROM unnest($1::bigint[], $2::int[])),
+          pl(entity_id, depth) AS MATERIALIZED (SELECT * FROM unnest($3::bigint[], $4::int[])),
+          e AS (
+            SELECT t.entity_id AS tgt, rel.id, rel.relation_id, rel.src AS pred, t.depth
+              FROM t JOIN relation rel ON rel.dst = t.entity_id AND rel.relation_type_id = ANY($5::smallint[])
+             WHERE rel.retracted_at IS NULL AND ${vw.sql}
+            UNION ALL
+            SELECT t.entity_id, rel.id, rel.relation_id, rel.dst, t.depth
+              FROM t JOIN relation rel ON rel.src = t.entity_id AND rel.relation_type_id = ANY($6::smallint[])
+             WHERE rel.retracted_at IS NULL AND ${vw.sql}
+          ),
+          v AS (
+            SELECT e.tgt AS entity_id,
+                   (array_agg(e.id   ORDER BY e.relation_id, e.id))[1] AS rel_pk,
+                   (array_agg(e.pred ORDER BY e.relation_id, e.id))[1] AS pred,
+                   count(DISTINCT e.relation_id) AS cnt
+              FROM e JOIN pl ON pl.entity_id = e.pred AND pl.depth = e.depth - 1
+             GROUP BY e.tgt)
+     SELECT v.entity_id, rt.name AS type, pe.key AS pred_key, r.relation_id, r.time_axis,
+            lower(r.time_span)::text AS lo, upper(r.time_span)::text AS hi, v.cnt
+       FROM v JOIN relation r ON r.id = v.rel_pk
+       JOIN relation_type rt ON rt.id = r.relation_type_id
+       JOIN entity pe ON pe.entity_id = v.pred`,
     [pageIds, pageDepths, levels.map((l) => l.id), levels.map((l) => l.depth), types.out, types.in, ...vw.params],
   );
   for (const v of via.rows) {
