@@ -1,14 +1,14 @@
-import type { ErrorCode } from '@remora/sdk';
+import { RemoraError, type ErrorCode } from '@remora/sdk';
 import { randomUUID } from 'node:crypto';
 import http from 'node:http';
-import type { AddressInfo } from 'node:net';
+import net, { type AddressInfo } from 'node:net';
 import type { ApiError } from '../api/apply.js';
 import type { RemoraApp } from '../app.js';
 import { getContract } from '../contract/index.js';
 import type { JsonLogger } from '../log.js';
 import { runApply, runQuery } from '../transport/dispatch.js';
 import { HttpError, readJsonBody } from './body.js';
-import { secretMatches } from './secret.js';
+import { isValidSecret, secretMatches } from './secret.js';
 import { statusFor } from './status.js';
 
 export interface HttpOptions {
@@ -56,7 +56,18 @@ function envelope(error: ApiError): { ok: false; error: ApiError } {
 }
 
 export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: JsonLogger): RemoraHttpServer {
+  if (!isValidSecret(opts.secret)) throw new RemoraError('invalid_config', 'REMORA_SECRET is not a valid secret');
+  if (opts.adminSecret !== undefined) {
+    if (!isValidSecret(opts.adminSecret)) throw new RemoraError('invalid_config', 'REMORA_ADMIN_SECRET is not a valid secret');
+    if (opts.adminSecret === opts.secret) {
+      throw new RemoraError('invalid_config', 'REMORA_ADMIN_SECRET must differ from REMORA_SECRET');
+    }
+  }
+  if (!(opts.requestTimeoutMs > 0)) throw new RemoraError('invalid_config', 'request timeout must be positive');
+  // our own body timer fires slightly before node's requestTimeout so the 408 envelope wins the race
+  const bodyTimeoutMs = Math.max(1, Math.floor(opts.requestTimeoutMs * 0.9));
   let shuttingDown = false;
+  let poolListening = false;
   let inflight = 0;
   let idle: (() => void) | undefined;
   let shutdownPromise: Promise<void> | undefined;
@@ -95,6 +106,8 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
   function lingerClose({ req, res }: Ctx): void {
     const socket = res.socket;
     if (!socket) return;
+    // Node's resOnFinish (_http_server.js) calls socket.destroySoon() after a `Connection: close`
+    // response; replacing it on this one socket is the only hook to linger instead of cutting.
     socket.destroySoon = () => {
       socket.end();
       let seen = 0;
@@ -119,7 +132,7 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
   const notFound = (ctx: Ctx): void => sendError(ctx, 404, NOT_FOUND);
 
   function envelopeStatus(r: { ok: boolean; error?: ApiError }): number {
-    return r.ok ? 200 : statusFor((r.error as ApiError).code);
+    return r.ok ? 200 : statusFor(r.error!.code);
   }
 
   const countOps = (body: unknown): number | undefined =>
@@ -134,7 +147,7 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
         method: 'POST',
         label: '/:secret/apply',
         async handle(ctx, o) {
-          const body = await readJsonBody(ctx.req, o.maxBodyBytes, o.requestTimeoutMs);
+          const body = await readJsonBody(ctx.req, o.maxBodyBytes, bodyTimeoutMs);
           const ops = countOps(body);
           if (ops !== undefined) ctx.ops = ops;
           const r = await runApply(app, body);
@@ -148,7 +161,7 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
         method: 'POST',
         label: '/:secret/query',
         async handle(ctx, o) {
-          const body = await readJsonBody(ctx.req, o.maxBodyBytes, o.requestTimeoutMs);
+          const body = await readJsonBody(ctx.req, o.maxBodyBytes, bodyTimeoutMs);
           const ops = countOps(body);
           if (ops !== undefined) ctx.ops = ops;
           const r = await runQuery(app, body);
@@ -213,7 +226,6 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
       });
     }
     if (path === '/health') {
-      ctx.close = false;
       return health(ctx);
     }
     if (!path.startsWith('/')) return notFound(ctx);
@@ -226,7 +238,7 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
 
     ctx.route = r.label;
     if (req.method !== r.method) return sendError(ctx, 405, methodNotAllowed(), { allow: r.method });
-    ctx.close = false;
+    if (r.method === 'POST') ctx.close = false; // the body is read (or fails and sets close itself)
     await r.handle(ctx, opts);
   }
 
@@ -234,41 +246,46 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
     const started = process.hrtime.bigint();
     const ctx: Ctx = { requestId: randomUUID(), req, res, route: '(unmatched)', close: false };
     res.setHeader('x-request-id', ctx.requestId);
-    inflight++;
+    // requests that arrive during shutdown (answered 503 at once) are not drained
+    const counted = !shuttingDown;
+    if (counted) inflight++;
     res.once('close', () => {
-      inflight--;
-      if (inflight === 0) idle?.();
       logger.info('request', {
         request_id: ctx.requestId,
         method: req.method,
         route: ctx.route,
-        status: res.statusCode,
+        status: res.writableFinished ? res.statusCode : 'aborted',
         ms: Number(process.hrtime.bigint() - started) / 1e6,
         ...(ctx.ops !== undefined ? { ops: ctx.ops } : {}),
         ...(ctx.code !== undefined ? { code: ctx.code } : {}),
       });
     });
 
-    route(ctx).catch((e: unknown) => {
-      if (e instanceof HttpError) {
-        if (e.closeConnection) ctx.close = true;
-        return sendError(ctx, e.status, { op_index: -1, code: e.code as ErrorCode, message: e.message });
-      }
-      // nothing about the failure reaches the client; the stack goes to the log only
-      logger.error('unhandled error', {
-        request_id: ctx.requestId,
-        route: ctx.route,
-        error: e instanceof Error ? e.message : String(e),
-        stack: e instanceof Error ? e.stack : undefined,
+    route(ctx)
+      .catch((e: unknown) => {
+        if (e instanceof HttpError) {
+          if (e.closeConnection) ctx.close = true;
+          return sendError(ctx, e.status, { op_index: -1, code: e.code as ErrorCode, message: e.message });
+        }
+        // nothing about the failure reaches the client; only the error name goes to the info log
+        // (messages can echo request data), the stack only to debug
+        const name = e instanceof Error ? e.name : typeof e;
+        logger.error('unhandled error', { request_id: ctx.requestId, route: ctx.route, error: name });
+        if (e instanceof Error) logger.debug('unhandled error stack', { request_id: ctx.requestId, stack: e.stack });
+        ctx.close = true;
+        sendError(ctx, 500, {
+          op_index: -1,
+          code: 'internal',
+          message: 'internal error',
+          details: { request_id: ctx.requestId },
+        });
+      })
+      .finally(() => {
+        // the handler's DB work is done here (also after a client abort), so app.close() is safe
+        if (!counted) return;
+        inflight--;
+        if (inflight === 0) idle?.();
       });
-      ctx.close = true;
-      sendError(ctx, 500, {
-        op_index: -1,
-        code: 'internal',
-        message: 'internal error',
-        details: { request_id: ctx.requestId },
-      });
-    });
   }
   server.on('request', onRequest);
   server.on('error', (e) => logger.error('http server error', { error: e.message }));
@@ -278,7 +295,6 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
   return {
     server,
     async listen(port, host) {
-      app.pool.on('error', onPoolError);
       await new Promise<void>((resolve, reject) => {
         const fail = (e: Error): void => reject(e);
         server.once('error', fail);
@@ -287,11 +303,17 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
           resolve();
         });
       });
+      if (!poolListening) {
+        poolListening = true;
+        app.pool.on('error', onPoolError);
+      }
       return server.address() as AddressInfo;
     },
     shutdown() {
       return (shutdownPromise ??= (async () => {
         shuttingDown = true;
+        // stop listening only: idle keep-alive sockets stay and keep answering 503 until the drain ends
+        const closed = new Promise<void>((resolve) => net.Server.prototype.close.call(server, () => resolve()));
         let drained = inflight === 0;
         if (!drained) {
           drained = await new Promise<boolean>((resolve) => {
@@ -307,7 +329,6 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
           });
         }
         if (!drained) logger.warn('shutdown timeout, closing remaining connections', { inflight });
-        const closed = new Promise<void>((resolve) => server.close(() => resolve()));
         server.closeIdleConnections();
         if (!drained) {
           server.closeAllConnections();
@@ -318,7 +339,10 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
           clearTimeout(grace);
         }
         await closed;
-        app.pool.off('error', onPoolError);
+        if (poolListening) {
+          poolListening = false;
+          app.pool.off('error', onPoolError);
+        }
       })());
     },
   };

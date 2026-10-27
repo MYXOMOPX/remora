@@ -24,7 +24,19 @@ export function createLogger(opts: { level?: LogLevel; write?: (line: string) =>
   const emit = (level: LogLevel, msg: string, meta?: unknown): void => {
     if (ORDER[level] < min) return;
     // reserved keys come last so meta can never overwrite them
-    write(JSON.stringify({ ...metaFields(meta), ts: new Date().toISOString(), level, msg }));
+    const ts = new Date().toISOString();
+    let line: string;
+    try {
+      line = JSON.stringify({ ...metaFields(meta), ts, level, msg });
+    } catch {
+      // BigInt, circular structures, throwing toJSON: logging must never throw
+      line = JSON.stringify({ ts, level, msg, log_error: 'meta not serializable' });
+    }
+    try {
+      write(line);
+    } catch {
+      // a broken sink must not break the caller
+    }
   };
   return {
     debug: (m, meta) => emit('debug', m, meta),

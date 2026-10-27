@@ -31,11 +31,11 @@ afterEach(async () => {
   while (cleanups.length) await cleanups.pop()!();
 });
 
-async function setup(over: Partial<HttpOptions> = {}): Promise<Env> {
+async function setup(over: Partial<HttpOptions> = {}, level: 'debug' | 'info' = 'debug'): Promise<Env> {
   const { url, drop } = await createTestDb();
   const app = await startRemora({ databaseUrl: url, importer });
   const lines: string[] = [];
-  const logger = createLogger({ level: 'debug', write: (l) => lines.push(l) });
+  const logger = createLogger({ level, write: (l) => lines.push(l) });
   const srv = createHttpServer(
     app,
     { secret: SECRET, adminSecret: ADMIN, maxBodyBytes: 1_048_576, requestTimeoutMs: 5_000, shutdownTimeoutMs: 2_000, ...over },
@@ -298,7 +298,8 @@ describe('HTTP transport: hostile bodies (Review Focus 2)', () => {
       // never finishes
     });
     expect(Date.now() - t0).toBeLessThan(4000);
-    if (r.status !== undefined) expect(r.status).toBe(408);
+    // either our 408 envelope or a closed socket, never a hang and never a success
+    expect([408, undefined]).toContain(r.status);
     expect((await raw(e.port, 'GET', '/health')).status).toBe(200);
   });
 });
@@ -322,8 +323,83 @@ describe('HTTP transport: request id, internal errors, access log', () => {
     const j = r.json();
     expect(j.error.code).toBe('internal');
     expect(j.error.details.request_id).toBe(r.headers['x-request-id']);
-    // the stack goes to the log, the body does not
-    expect(e.lines.some((l) => l.includes('secret detail'))).toBe(true);
+    // the error line carries the name only; message and stack are debug-only
+    expect(e.lines.filter((l) => l.includes('secret detail') && !l.includes('unhandled error stack'))).toEqual([]);
+    expect(e.lines.some((l) => l.includes('"error":"Error"'))).toBe(true);
+    // the stack is a debug-level line
+    expect(e.lines.some((l) => l.includes('unhandled error stack') && l.includes('secret detail'))).toBe(true);
+  });
+
+  it('info level never logs the stack or the message of unexpected errors', async () => {
+    const e = await setup({}, 'info');
+    e.app.apply = async () => {
+      throw new Error('secret detail');
+    };
+    await post(e, `/${SECRET}/apply`, { ops: [{ op: 'create_entity', key: 'x' }] });
+    expect(e.lines.some((l) => l.includes('secret detail'))).toBe(false);
+    expect(e.lines.some((l) => l.includes('stack'))).toBe(false);
+  });
+
+  it('logs "aborted" for a client that left before the response, and keeps the handler counted until it ends', async () => {
+    const e = await setup();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const started = new Promise<void>((r) => (entered = r));
+    e.app.query = async () => {
+      entered();
+      await gate;
+      return { ok: true, results: [] };
+    };
+    e.lines.length = 0;
+    const req = http.request({ host: '127.0.0.1', port: e.port, method: 'POST', path: `/${SECRET}/query`, headers: { 'content-type': 'application/json' } });
+    req.on('error', () => undefined);
+    req.end(JSON.stringify({ ops: [{ op: 'list_time_axes' }] }));
+    await started;
+    req.destroy();
+    await new Promise((r) => setTimeout(r, 100));
+    let down = false;
+    const sd = e.srv.shutdown().then(() => (down = true));
+    await new Promise((r) => setTimeout(r, 300));
+    expect(down).toBe(false); // still waiting for the handler although the client is gone
+    release();
+    await sd;
+    const reqs = e.lines.map((l) => JSON.parse(l)).filter((l) => l.msg === 'request');
+    expect(reqs[0].status).toBe('aborted');
+  });
+
+  it('GET with a body keeps the close-after-response rule', async () => {
+    const e = await setup();
+    const h = await raw(e.port, 'GET', '/health', '{}', { 'content-type': 'application/json', 'content-length': '2' });
+    expect(h.status).toBe(200);
+    expect(h.headers.connection).toBe('close');
+    const s = await raw(e.port, 'GET', `/${SECRET}/schema`, '{}', { 'content-type': 'application/json', 'content-length': '2' });
+    expect(s.status).toBe(200);
+    expect(s.headers.connection).toBe('close');
+  });
+
+  it('refuses invalid secrets and timeouts at construction', async () => {
+    const e = await setup();
+    const base = { secret: SECRET, maxBodyBytes: 1000, requestTimeoutMs: 1000, shutdownTimeoutMs: 1000 };
+    const mk = (o: Partial<HttpOptions>) => () => createHttpServer(e.app, { ...base, ...o }, createLogger({ write: () => {} }));
+    expect(mk({ secret: 'short' })).toThrow();
+    expect(mk({ adminSecret: SECRET })).toThrow();
+    expect(mk({ adminSecret: 'short' })).toThrow();
+    expect(mk({ requestTimeoutMs: 0 })).toThrow();
+    expect(mk({ adminSecret: ADMIN })).not.toThrow();
+  });
+
+  it('the logger never throws on unserializable meta', () => {
+    const out: string[] = [];
+    const log = createLogger({ write: (l) => out.push(l) });
+    const circ: Record<string, unknown> = {};
+    circ.self = circ;
+    expect(() => log.info('a', { n: 1n })).not.toThrow();
+    expect(() => log.info('b', circ)).not.toThrow();
+    expect(out).toHaveLength(2);
+    expect(JSON.parse(out[0]!).msg).toBe('a');
+    const bad = createLogger({ write: () => { throw new Error('sink'); } });
+    expect(() => bad.error('x')).not.toThrow();
   });
 
   it('writes one structured access line per request with a redacted route', async () => {
@@ -383,11 +459,11 @@ describe('HTTP transport: health and shutdown (Review Focus 5)', () => {
       await gate;
       return realQuery(req);
     };
-    const agent = new http.Agent({ keepAlive: true, maxSockets: 2 });
+    // 503s during shutdown carry Connection: close and the listener is gone, so each follow-up needs its own warm socket
+    const agent = new http.Agent({ keepAlive: true, maxSockets: 3 });
     cleanups.push(async () => agent.destroy());
-    // warm a second socket
-    const warm = await Promise.all([raw(e.port, 'GET', '/health', undefined, {}, agent), raw(e.port, 'GET', '/health', undefined, {}, agent)]);
-    expect(warm.map((w) => w.status)).toEqual([200, 200]);
+    const warm = await Promise.all([0, 1, 2].map(() => raw(e.port, 'GET', '/health', undefined, {}, agent)));
+    expect(warm.map((w) => w.status)).toEqual([200, 200, 200]);
 
     const body = JSON.stringify({ ops: [{ op: 'list_time_axes' }] });
     const inflight = raw(e.port, 'POST', `/${SECRET}/query`, body, {}, agent);
@@ -412,6 +488,43 @@ describe('HTTP transport: health and shutdown (Review Focus 5)', () => {
     expect(done).toBe(true);
     // the pool belongs to the caller: still usable after shutdown()
     await e.app.pool.query('SELECT 1');
+  });
+
+  it('steady traffic during the drain does not delay shutdown', async () => {
+    const e = await setup({ shutdownTimeoutMs: 5000 });
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let entered!: () => void;
+    const started = new Promise<void>((r) => (entered = r));
+    const realQuery = e.app.query.bind(e.app);
+    e.app.query = async (req) => {
+      entered();
+      await gate;
+      return realQuery(req);
+    };
+    const agent = new http.Agent({ keepAlive: true, maxSockets: 4 });
+    cleanups.push(async () => agent.destroy());
+    const body = JSON.stringify({ ops: [{ op: 'list_time_axes' }] });
+    await Promise.all([raw(e.port, 'GET', '/health', undefined, {}, agent), raw(e.port, 'GET', '/health', undefined, {}, agent)]);
+    const inflight = raw(e.port, 'POST', `/${SECRET}/query`, body, {}, agent);
+    await started;
+    const down = e.srv.shutdown();
+    let stop = false;
+    const traffic = (async () => {
+      while (!stop) {
+        await raw(e.port, 'GET', '/health', undefined, {}, agent).catch(() => undefined);
+        await new Promise((r) => setTimeout(r, 5));
+      }
+    })();
+    await new Promise((r) => setTimeout(r, 200));
+    const t0 = Date.now();
+    release();
+    expect((await inflight).status).toBe(200);
+    await down;
+    stop = true;
+    await traffic;
+    expect(Date.now() - t0).toBeLessThan(2500);
+    expect(e.lines.some((l) => l.includes('shutdown timeout'))).toBe(false);
   });
 
   it('shutdown gives up on stuck requests after shutdownTimeoutMs', async () => {
