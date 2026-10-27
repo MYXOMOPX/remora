@@ -10,6 +10,7 @@ import { addProperty, endProperty, replaceProperty, retractProperty } from '../s
 import { addRelation, endRelation, retractRelation, type RelationRef } from '../services/relations.js';
 import { parseEventTimes, parseMoment, parseSpans } from '../services/time.js';
 import { bool, int, isObj, optStr, optStrArr, str, type Obj } from './args.js';
+import { MAX_OPS } from './limits.js';
 
 export type ApiError = {
   op_index: number;
@@ -304,6 +305,9 @@ const HANDLERS: Record<string, Handler> = {
   },
 };
 
+/** Names of the implemented apply ops (the contract schemas must cover exactly these). */
+export const APPLY_OP_NAMES: readonly string[] = Object.keys(HANDLERS);
+
 /** snake_case + JSON-number conversion of service results (bigint -> number). */
 export function toApi(x: unknown): unknown {
   if (typeof x === 'bigint') return Number(x);
@@ -370,6 +374,12 @@ export async function apply(pool: pg.Pool, registry: PluginRegistry, request: un
   if (!isObj(request)) return invalid('request must be an object {ops: [...]}');
   const ops = request.ops;
   if (!Array.isArray(ops) || ops.length === 0) return invalid('ops must be a non-empty array');
+  if (ops.length > MAX_OPS) {
+    return {
+      ok: false,
+      error: { op_index: -1, code: 'invalid_param', message: `at most ${MAX_OPS} ops per request`, details: { limit: MAX_OPS } },
+    };
+  }
 
   const client = await pool.connect();
   let destroy: Error | undefined;

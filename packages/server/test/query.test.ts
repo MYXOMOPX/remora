@@ -248,3 +248,19 @@ describe('query', () => {
     });
   });
 });
+
+describe('query op cap', () => {
+  it('1001 ops -> invalid_param with the limit', async () => {
+    await withDb(async ({ q }) => {
+      const ops = Array.from({ length: 1001 }, () => ({ op: 'list_relation_types' }));
+      const e = err(await q(...ops)) as { op_index: number; code: string; details?: unknown };
+      expect(e).toMatchObject({ op_index: -1, code: 'invalid_param', details: { limit: 1000 } });
+    });
+  });
+  it('1000 ops succeed', async () => {
+    await withDb(async ({ q }) => {
+      const ops = Array.from({ length: 1000 }, () => ({ op: 'list_relation_types' }));
+      expect(ok(await q(...ops))).toHaveLength(1000);
+    });
+  });
+});

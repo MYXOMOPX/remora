@@ -25,6 +25,7 @@ import { neighbors, type NeighborRow } from '../services/neighbors.js';
 import { parseWhen } from '../services/time.js';
 import { int, isObj, optBool, optInt, optStr, optStrArr, str, type Obj } from './args.js';
 import { failure, mapPgError, rollback, type ApiError } from './apply.js';
+import { MAX_OPS } from './limits.js';
 
 export type QueryResponse = { ok: true; results: unknown[] } | { ok: false; error: ApiError };
 
@@ -285,6 +286,9 @@ const HANDLERS: Record<string, Handler> = {
   },
 };
 
+/** Names of the implemented query ops (the contract schemas must cover exactly these). */
+export const QUERY_OP_NAMES: readonly string[] = Object.keys(HANDLERS);
+
 export async function query(pool: pg.Pool, registry: PluginRegistry, request: unknown): Promise<QueryResponse> {
   const bad = (message: string): QueryResponse => ({
     ok: false,
@@ -293,6 +297,12 @@ export async function query(pool: pg.Pool, registry: PluginRegistry, request: un
   if (!isObj(request)) return bad('request must be an object {ops: [...]}');
   const ops = request.ops;
   if (!Array.isArray(ops) || ops.length === 0) return bad('ops must be a non-empty array');
+  if (ops.length > MAX_OPS) {
+    return {
+      ok: false,
+      error: { op_index: -1, code: 'invalid_param', message: `at most ${MAX_OPS} ops per request`, details: { limit: MAX_OPS } },
+    };
+  }
 
   const client = await pool.connect();
   let destroy: Error | undefined;

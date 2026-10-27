@@ -271,7 +271,7 @@ relation_id=10  Bob → Google  works_at  real      [1790812800,1792540800)
 
 Ошибка (весь пакет откатывается): `{"ok": false, "error": {"op_index": 2, "code": "unknown_entity", "message": "...", "details": {...}}}`.
 
-Коды: `unknown_entity`, `unknown_type`, `unknown_axis`, `unknown_ref`, `value_type_mismatch`, `single_valued_conflict`, `timeless_conflict`, `invalid_time` (с причиной по `value_schema`), `not_found`, `name_taken`, `invalid_payload`, `unknown_source`, `too_many_paths`, `concurrent_update` (повторить пакет), `axis_unavailable`, `source_unavailable` (плагин недоступен, раздел 12), `invalid_name`, `invalid_param`, `invalid_plugin`, `invalid_config`.
+Коды: `unknown_entity`, `unknown_type`, `unknown_axis`, `unknown_ref`, `value_type_mismatch`, `single_valued_conflict`, `timeless_conflict`, `invalid_time` (с причиной по `value_schema`), `not_found`, `name_taken`, `invalid_payload`, `unknown_source`, `too_many_paths`, `concurrent_update` (повторить пакет), `axis_unavailable`, `source_unavailable` (плагин недоступен, раздел 12), `invalid_name`, `invalid_param`, `invalid_plugin`, `invalid_config`, `internal` (неожиданный сбой сервера, только транспорт), `timeout` (запрос превысил `statement_timeout`; пакет откачен, сузить запрос).
 
 ### Контракт
 

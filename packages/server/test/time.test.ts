@@ -73,6 +73,39 @@ describe('parseWhen', () => {
   it('at with from', () => expect(codeOf(() => parseWhen(reg, { axis: 'game_day', at: 1, from: 1 }))).toBe('invalid_param'));
 });
 
+describe('R34: explicit null is not a time value', () => {
+  // an axis whose valueSchema accepts null must still reject it
+  const nullable = { ...intAxis('nullable'), valueSchema: {}, encode: () => 0n };
+  const nreg = fakeRegistry([
+    { id: 1, def: intAxis('game_day') },
+    { id: 3, def: nullable },
+  ]);
+  for (const r of [reg, nreg]) {
+    const ax = r === reg ? 'game_day' : 'nullable';
+    it('null bounds -> invalid_time (' + ax + ')', () => {
+      expect(codeOf(() => parseSpans(r, { axis: ax, from: null }))).toBe('invalid_time');
+      expect(codeOf(() => parseSpans(r, { axis: ax, to: null }))).toBe('invalid_time');
+      expect(codeOf(() => parseMoment(r, { axis: ax, at: null }))).toBe('invalid_time');
+      expect(codeOf(() => parseWhen(r, { axis: ax, at: null }))).toBe('invalid_time');
+      expect(codeOf(() => parseWhen(r, { axis: ax, during: [null, 5] }))).toBe('invalid_time');
+      expect(codeOf(() => parseWhen(r, { axis: ax, during: [1, null] }))).toBe('invalid_time');
+      expect(codeOf(() => parseEventTimes(r, { axis: ax, at: null }))).toBe('invalid_time');
+      expect(codeOf(() => parseEventTimes(r, { axis: ax, from: null }))).toBe('invalid_time');
+      expect(codeOf(() => parseEventTimes(r, { axis: ax, to: null }))).toBe('invalid_time');
+    });
+  }
+  it('details carry the axis and a reason', () => {
+    try {
+      parseSpans(reg, { axis: 'game_day', from: null });
+      throw new Error('expected throw');
+    } catch (e) {
+      expect(e).toBeInstanceOf(RemoraError);
+      expect((e as RemoraError).details).toMatchObject({ axis: 'game_day' });
+      expect(typeof (e as RemoraError).details?.reason).toBe('string');
+    }
+  });
+});
+
 describe('encodeValue / formatTime', () => {
   const big = reg.getAxis('big');
   it('out of int8', () =>

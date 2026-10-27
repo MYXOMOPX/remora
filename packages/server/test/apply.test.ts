@@ -407,3 +407,18 @@ describe('apply', () => {
     expect(mapPgError({ code: '22021' })?.code).toBe('invalid_param');
   });
 });
+
+describe('apply op cap', () => {
+  it('1001 ops -> invalid_param with the limit', async () => {
+    await withDb(async ({ run }) => {
+      const ops = Array.from({ length: 1001 }, (_, i) => ({ op: 'create_entity', key: 'e' + i }));
+      expect(errOf(await run(...ops))).toMatchObject({ op_index: -1, code: 'invalid_param', details: { limit: 1000 } });
+    });
+  });
+  it('1000 ops succeed', async () => {
+    await withDb(async ({ run }) => {
+      const ops = Array.from({ length: 1000 }, (_, i) => ({ op: 'create_entity', key: 'e' + i }));
+      expect(okResults(await run(...ops))).toHaveLength(1000);
+    });
+  });
+});

@@ -65,6 +65,17 @@ export function encodeValue(axis: AxisRef, value: unknown): bigint {
   return n;
 }
 
+/** R34: an explicit null is never a time value (checked before the axis valueSchema). */
+function encodeBound(axis: AxisRef, value: unknown): bigint {
+  if (value === null) {
+    throw new RemoraError('invalid_time', 'null is not a time value; omit the bound instead', {
+      axis: axis.name,
+      reason: 'null is not a time value; omit the bound instead',
+    });
+  }
+  return encodeValue(axis, value);
+}
+
 function rejectUnknownKeys(raw: Record<string, unknown>, allowed: string[], what: string): void {
   const extra = Object.keys(raw).find((k) => !allowed.includes(k));
   if (extra !== undefined) throw invalidParam(`${what} has an unknown key ${extra}`, { field: extra });
@@ -80,8 +91,8 @@ function parseSpan(registry: PluginRegistry, raw: unknown): Span {
   if ('at' in raw || 'during' in raw) throw invalidParam('time on add must not contain at/during; use from/to');
   rejectUnknownKeys(raw, ['axis', 'from', 'to'], 'time');
   const axis = readAxis(registry, raw);
-  const lo = raw.from === undefined ? null : encodeValue(axis, raw.from);
-  const hi = raw.to === undefined ? null : encodeValue(axis, raw.to);
+  const lo = raw.from === undefined ? null : encodeBound(axis, raw.from);
+  const hi = raw.to === undefined ? null : encodeBound(axis, raw.to);
   if (lo !== null && hi !== null && lo >= hi) {
     throw new RemoraError('invalid_time', 'time.from must be less than time.to', { axis: axis.name });
   }
@@ -112,7 +123,7 @@ export function parseMoment(registry: PluginRegistry, raw: unknown): Moment {
   rejectUnknownKeys(raw, ['axis', 'at'], 'time');
   const axis = readAxis(registry, raw);
   if (raw.at === undefined) throw invalidParam('time.at is required');
-  return { axis, at: encodeValue(axis, raw.at) };
+  return { axis, at: encodeBound(axis, raw.at) };
 }
 
 export function parseWhen(registry: PluginRegistry, raw: unknown): When | undefined {
@@ -124,12 +135,12 @@ export function parseWhen(registry: PluginRegistry, raw: unknown): When | undefi
   const hasDuring = raw.during !== undefined;
   if (hasAt === hasDuring) throw invalidParam('when needs exactly one of at, during');
   const axis = readAxis(registry, raw);
-  if (hasAt) return { axis, at: encodeValue(axis, raw.at) };
+  if (hasAt) return { axis, at: encodeBound(axis, raw.at) };
   if (!Array.isArray(raw.during) || raw.during.length !== 2) {
     throw invalidParam('when.during must be an array [from, to]');
   }
-  const from = encodeValue(axis, raw.during[0]);
-  const to = encodeValue(axis, raw.during[1]);
+  const from = encodeBound(axis, raw.during[0]);
+  const to = encodeBound(axis, raw.during[1]);
   if (from >= to) throw new RemoraError('invalid_time', 'when.during must satisfy from < to', { axis: axis.name });
   return { axis, from, to };
 }
@@ -169,14 +180,14 @@ function parseEventSpan(registry: PluginRegistry, raw: unknown): EventSpan {
   const axis = readAxis(registry, raw);
   if (raw.at !== undefined) {
     if ('from' in raw || 'to' in raw) throw invalidParam('time.at must not be combined with from/to');
-    const at = encodeValue(axis, raw.at);
+    const at = encodeBound(axis, raw.at);
     if (at >= INT8_MAX) {
       throw new RemoraError('invalid_time', 'time.at is too large for an instant', { axis: axis.name });
     }
     return { axis, lo: at, hi: at + 1n, instant: true };
   }
-  const lo = raw.from === undefined ? null : encodeValue(axis, raw.from);
-  const hi = raw.to === undefined ? null : encodeValue(axis, raw.to);
+  const lo = raw.from === undefined ? null : encodeBound(axis, raw.from);
+  const hi = raw.to === undefined ? null : encodeBound(axis, raw.to);
   if (lo !== null && hi !== null && lo >= hi) {
     throw new RemoraError('invalid_time', 'time.from must be less than time.to', { axis: axis.name });
   }
