@@ -20,7 +20,7 @@ export async function runMigrations(pool: pg.Pool | pg.PoolClient, dir: string =
     if (applied.has(file)) continue;
     const sql = await readFile(`${dir}/${file}`, 'utf8');
     // a pool hands out a client per migration; a client runs BEGIN..COMMIT on itself
-    const client = pool instanceof pg.Pool ? await pool.connect() : pool;
+    const client = 'release' in pool ? pool : await pool.connect();
     try {
       await client.query('BEGIN');
       await client.query(sql);

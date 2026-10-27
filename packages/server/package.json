@@ -1,10 +1,14 @@
 {
   "name": "@remora/server",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "remora-source": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
   },
   "devDependencies": {
     "@testcontainers/postgresql": "^12.2.1",
@@ -13,6 +17,7 @@
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",
     "@remora/core-plugin": "*",
+    "@remora/sdk": "*",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "pg": "^8.23.1"

@@ -7,11 +7,15 @@
   ],
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc -p packages/sdk --noEmit && tsc -p packages/server --noEmit && tsc -p packages/core-plugin --noEmit"
+    "typecheck": "tsc -p packages/sdk --noEmit && tsc -p packages/server --noEmit && tsc -p packages/core-plugin --noEmit",
+    "build": "tsc -p packages/sdk/tsconfig.build.json && tsc -p packages/core-plugin/tsconfig.build.json && tsc -p packages/server/tsconfig.build.json",
+    "start": "node packages/server/dist/main.js",
+    "gen-secret": "node packages/server/dist/main.js gen-secret"
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
-  }
+  },
+  "version": "1.0.0"
 }

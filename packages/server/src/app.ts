@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { RemoraError } from '@remora/sdk';
 import pg from 'pg';
 import { apply, type ApplyResponse } from './api/apply.js';
 import { query, type QueryResponse } from './api/query.js';
@@ -36,6 +37,8 @@ export interface StartOptions {
   statementTimeoutMs?: number;
   /** plugin directory (used by directory loading) */
   pluginsDir?: string;
+  /** max wait for the startup advisory lock held by another replica, ms (default 600000) */
+  startupLockTimeoutMs?: number;
 }
 
 export interface RemoraApp {
@@ -58,8 +61,13 @@ export interface RemoraApp {
 export async function startRemora(opts: StartOptions): Promise<RemoraApp> {
   const pool = new pg.Pool({
     connectionString: opts.databaseUrl,
-    ...(opts.statementTimeoutMs !== undefined ? { statement_timeout: opts.statementTimeoutMs } : {}),
+    ...(opts.statementTimeoutMs ? { statement_timeout: opts.statementTimeoutMs } : {}),
+    // 0 must really disable: pg skips a falsy statement_timeout, so a database default would win
+    ...(opts.statementTimeoutMs === 0 ? { options: '-c statement_timeout=0' } : {}),
   });
+  // an idle client can emit 'error' (server restart, network); without a listener that crashes the process.
+  // The listener stays after app.close().
+  pool.on('error', (e) => opts.logger?.error('database pool error', e));
   try {
     const importer = opts.importer ?? pluginImporter(opts.pluginsDir ?? join(process.cwd(), 'plugins'));
     const registry = await startUnderLock(pool, opts, importer);
@@ -90,10 +98,15 @@ export async function startRemora(opts: StartOptions): Promise<RemoraApp> {
 async function startUnderLock(pool: pg.Pool, opts: StartOptions, importer: Importer): Promise<PluginRegistry> {
   const client = await pool.connect();
   let destroy: Error | undefined;
+  // an error while we wait for the lock must reject the start, not crash the process
+  client.on('error', (e) => {
+    destroy ??= e;
+    opts.logger?.error('database connection error during startup', e);
+  });
   try {
     // startup may legitimately wait for another replica or run long migrations
     await client.query('SET statement_timeout = 0');
-    await client.query(`SELECT pg_advisory_lock(hashtextextended('remora:startup', 0))`);
+    await acquireStartupLock(client, opts);
     try {
       await runMigrations(client, opts.migrationsDir);
       const core = await client.query('SELECT 1 FROM plugin WHERE name = $1', [CORE_PLUGIN_NAME]);
@@ -114,5 +127,28 @@ async function startUnderLock(pool: pg.Pool, opts: StartOptions, importer: Impor
     throw e;
   } finally {
     client.release(destroy);
+  }
+}
+
+const LOCK_POLL_MS = 250;
+const LOCK_WARN_EVERY_MS = 30_000;
+
+/** Polls pg_try_advisory_lock so the wait is logged and bounded. */
+async function acquireStartupLock(client: pg.PoolClient, opts: StartOptions): Promise<void> {
+  const limit = opts.startupLockTimeoutMs ?? 600_000;
+  const started = Date.now();
+  let nextWarn = 0;
+  for (;;) {
+    const r = await client.query<{ ok: boolean }>(`SELECT pg_try_advisory_lock(hashtextextended('remora:startup', 0)) AS ok`);
+    if (r.rows[0]?.ok) return;
+    const waited = Date.now() - started;
+    if (waited >= limit) {
+      throw new RemoraError('timeout', 'timed out waiting for the startup lock held by another replica', { waited_ms: waited });
+    }
+    if (waited >= nextWarn) {
+      opts.logger?.warn('waiting for startup lock held by another replica', { waited_ms: waited });
+      nextWarn = waited + LOCK_WARN_EVERY_MS;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(LOCK_POLL_MS, Math.max(1, limit - waited))));
   }
 }

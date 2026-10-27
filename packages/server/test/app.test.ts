@@ -135,3 +135,58 @@ describe('startRemora', () => {
     ).rejects.toThrow();
   });
 });
+
+describe('startRemora hardening', () => {
+  it('statementTimeoutMs 0 really disables a database-level default', async () => {
+    const { url, drop, pool } = await createTestDb();
+    try {
+      const db = new URL(url).pathname.slice(1);
+      await pool.query(`ALTER DATABASE ${db} SET statement_timeout = '5s'`);
+      const off = await startRemora({ databaseUrl: url, importer, statementTimeoutMs: 0 });
+      try {
+        expect((await off.pool.query('SHOW statement_timeout')).rows[0].statement_timeout).toBe('0');
+      } finally {
+        await off.close();
+      }
+      const on = await startRemora({ databaseUrl: url, importer, statementTimeoutMs: 1234 });
+      try {
+        expect((await on.pool.query('SHOW statement_timeout')).rows[0].statement_timeout).toBe('1234ms');
+      } finally {
+        await on.close();
+      }
+    } finally {
+      await drop();
+    }
+  });
+
+  it('a held startup lock is logged and the wait is bounded', async () => {
+    const { url, drop, pool } = await createTestDb();
+    const holder = await pool.connect();
+    try {
+      await holder.query(`SELECT pg_advisory_lock(hashtextextended('remora:startup', 0))`);
+      const warn = vi.fn();
+      await expect(
+        startRemora({ databaseUrl: url, importer, logger: { warn, error: vi.fn() }, startupLockTimeoutMs: 600 }),
+      ).rejects.toMatchObject({ code: 'timeout' });
+      expect(warn).toHaveBeenCalledWith('waiting for startup lock held by another replica', expect.anything());
+    } finally {
+      holder.release();
+      await drop();
+    }
+  });
+
+  it('an error on an idle pool client is logged instead of crashing the process', async () => {
+    await withUrl(async (url) => {
+      const error = vi.fn();
+      const app = await startRemora({ databaseUrl: url, importer, logger: { warn: vi.fn(), error } });
+      try {
+        expect(app.pool.listenerCount('error')).toBeGreaterThan(0);
+        app.pool.emit('error', new Error('boom'), {});
+        expect(error).toHaveBeenCalled();
+      } finally {
+        await app.close();
+      }
+      expect(app.pool.listenerCount('error')).toBeGreaterThan(0);
+    });
+  });
+});
