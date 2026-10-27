@@ -128,6 +128,10 @@ describe('startRemora', () => {
     expect(mapPgError({ code: '57014' })?.code).toBe('timeout');
   });
 
+  it('mapPgError maps 54001 (statement too complex) to invalid_param', () => {
+    expect(mapPgError({ code: '54001' })?.code).toBe('invalid_param');
+  });
+
   it('fails on an unreachable database without hanging', async () => {
     const spy = vi.fn();
     await expect(

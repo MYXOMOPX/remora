@@ -39,6 +39,8 @@ export interface StartOptions {
   pluginsDir?: string;
   /** max wait for the startup advisory lock held by another replica, ms (default 600000) */
   startupLockTimeoutMs?: number;
+  /** max wait for a pool connection / a new database connection, ms (pg default: unlimited) */
+  connectionTimeoutMs?: number;
 }
 
 export interface RemoraApp {
@@ -61,6 +63,7 @@ export interface RemoraApp {
 export async function startRemora(opts: StartOptions): Promise<RemoraApp> {
   const pool = new pg.Pool({
     connectionString: opts.databaseUrl,
+    ...(opts.connectionTimeoutMs ? { connectionTimeoutMillis: opts.connectionTimeoutMs } : {}),
     ...(opts.statementTimeoutMs ? { statement_timeout: opts.statementTimeoutMs } : {}),
     // 0 must really disable: pg skips a falsy statement_timeout, so a database default would win
     ...(opts.statementTimeoutMs === 0 ? { options: '-c statement_timeout=0' } : {}),

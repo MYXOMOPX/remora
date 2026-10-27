@@ -30,6 +30,15 @@ export interface Contract {
   error_codes: readonly string[];
 }
 
+function deepFreeze<T>(value: T, seen = new Set<object>()): T {
+  if (typeof value === 'object' && value !== null && !seen.has(value)) {
+    seen.add(value);
+    for (const v of Object.values(value)) deepFreeze(v, seen);
+    Object.freeze(value);
+  }
+  return value;
+}
+
 const contract: Contract = {
   version: '1.0.0',
   apply: applyRequestSchema,
@@ -40,8 +49,10 @@ const contract: Contract = {
     results: { apply: APPLY_RESULTS, query: QUERY_RESULTS },
   },
   error: apiErrorSchema,
-  error_codes: ERROR_CODES,
+  error_codes: [...ERROR_CODES],
 };
+// the object is shared by every caller (schema route, MCP tool list, validators): nobody may change it
+deepFreeze(contract);
 
 /** The same object on every call. */
 export function getContract(): Contract {

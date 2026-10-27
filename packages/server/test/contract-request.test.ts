@@ -369,3 +369,19 @@ describe('request schemas agree with the hand validator (drift)', () => {
     }
   });
 });
+
+describe('getContract immutability', () => {
+  it('the shared contract is deeply frozen: mutation throws and validation still works', async () => {
+    const { getContract, validateApplyRequest } = await import('../src/contract/index.js');
+    const c = getContract() as any;
+    expect(() => {
+      c.version = 'x';
+    }).toThrow(TypeError);
+    expect(() => {
+      c.apply.properties.ops.maxItems = 1;
+    }).toThrow(TypeError);
+    expect(() => c.error_codes.push('x')).toThrow(TypeError);
+    expect(Object.isFrozen(c.responses.results.query)).toBe(true);
+    expect(validateApplyRequest({ ops: [{ op: 'create_entity', key: 'a' }] })).toBeNull();
+  });
+});

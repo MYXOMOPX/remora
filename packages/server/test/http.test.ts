@@ -193,6 +193,25 @@ describe('HTTP transport: secret routing (Review Focus 1)', () => {
 });
 
 describe('HTTP transport: hostile bodies (Review Focus 2)', () => {
+  it('deeply nested JSON is a 400 invalid_param, not a 500', async () => {
+    const e = await setup();
+    await seed(e);
+    const nest = (n: number): string => '['.repeat(n) + ']'.repeat(n);
+    for (const depth of [100_000, 65]) {
+      const body = `{"ops":[{"op":"add_evidence","source":"chat_message","payload":${nest(depth)}}]}`;
+      for (const route of ['apply', 'query']) {
+        const r = await post(e, `/${SECRET}/${route}`, body);
+        expect(r.status, `${route} ${depth}`).toBe(400);
+        expect(r.json().error).toMatchObject({ op_index: -1, code: 'invalid_param' });
+        expect(r.json().error.message).toMatch(/nest/);
+      }
+    }
+    const fine = await post(e, `/${SECRET}/query`, `{"ops":[{"op":"get_entity","key":"bob","x":${nest(60)}}]}`);
+    expect(fine.status).not.toBe(500);
+    const mcp = await post(e, `/${SECRET}/mcp`, `{"jsonrpc":"2.0","id":1,"method":"ping","params":${nest(100_000)}}`);
+    expect(mcp.status).toBe(400);
+  });
+
   it('bad JSON, wrong shapes, oversize, wrong content type, wrong method, too many ops', async () => {
     const e = await setup();
     await seed(e);
@@ -425,6 +444,24 @@ describe('HTTP transport: health and shutdown (Review Focus 5)', () => {
     const h = await raw(e.port, 'GET', '/health');
     expect(h.status).toBe(200);
     expect(h.json()).toEqual({ status: 'degraded' });
+  });
+
+  it('concurrent /health calls on a saturated pool do not grow the pool wait queue', async () => {
+    const e = await setup({ healthTimeoutMs: 600 });
+    const held = await Promise.all(Array.from({ length: e.app.pool.options.max ?? 10 }, () => e.app.pool.connect()));
+    try {
+      let maxWaiting = 0;
+      const sampler = setInterval(() => (maxWaiting = Math.max(maxWaiting, e.app.pool.waitingCount)), 5);
+      const results = await Promise.all(Array.from({ length: 150 }, () => raw(e.port, 'GET', '/health')));
+      clearInterval(sampler);
+      expect(results.every((r) => r.status === 503 && r.json().status === 'unavailable')).toBe(true);
+      expect(maxWaiting).toBeLessThanOrEqual(1);
+    } finally {
+      for (const c of held) c.release();
+    }
+    // the pool recovers: the shared probe finishes and the next call succeeds
+    const h = await raw(e.port, 'GET', '/health');
+    expect(h.status).toBe(200);
   });
 
   it('health is 503 unavailable when the pool is ended', async () => {

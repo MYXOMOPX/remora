@@ -14,6 +14,8 @@ export interface RemoraConfig {
   requestTimeoutMs: number;
   statementTimeoutMs: number;
   shutdownTimeoutMs: number;
+  dbConnectTimeoutMs: number;
+  maxConnections: number;
   logLevel: LogLevel;
 }
 
@@ -55,7 +57,7 @@ export function loadConfig(env: NodeJS.ProcessEnv, cwd: string = process.cwd()):
   if (!LEVELS.includes(level)) throw bad('LOG_LEVEL', `must be one of ${LEVELS.join(', ')}`);
   return {
     databaseUrl,
-    host: env.HOST || '0.0.0.0',
+    host: env.HOST || '127.0.0.1',
     port: integer(env, 'PORT', 8080, 0, 65535),
     secret,
     adminSecret,
@@ -64,6 +66,8 @@ export function loadConfig(env: NodeJS.ProcessEnv, cwd: string = process.cwd()):
     requestTimeoutMs: integer(env, 'REMORA_REQUEST_TIMEOUT_MS', 30_000, 1),
     statementTimeoutMs: integer(env, 'REMORA_STATEMENT_TIMEOUT_MS', 30_000, 0),
     shutdownTimeoutMs: integer(env, 'REMORA_SHUTDOWN_TIMEOUT_MS', 10_000, 0),
+    dbConnectTimeoutMs: integer(env, 'REMORA_DB_CONNECT_TIMEOUT_MS', 10_000, 1),
+    maxConnections: integer(env, 'REMORA_MAX_CONNECTIONS', 1024, 1),
     logLevel: level as LogLevel,
   };
 }

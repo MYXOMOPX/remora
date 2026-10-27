@@ -24,6 +24,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<void
       databaseUrl: config.databaseUrl,
       pluginsDir: config.pluginsDir,
       statementTimeoutMs: config.statementTimeoutMs,
+      connectionTimeoutMs: config.dbConnectTimeoutMs,
       logger,
     });
     const started = app;
@@ -35,6 +36,7 @@ export async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<void
         maxBodyBytes: config.maxBodyBytes,
         requestTimeoutMs: config.requestTimeoutMs,
         shutdownTimeoutMs: config.shutdownTimeoutMs,
+        maxConnections: config.maxConnections,
       },
       logger,
     );

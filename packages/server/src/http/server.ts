@@ -19,6 +19,10 @@ export interface HttpOptions {
   maxBodyBytes: number;
   requestTimeoutMs: number;
   shutdownTimeoutMs: number;
+  /** how long /health waits for its database probe, ms (default 3000) */
+  healthTimeoutMs?: number;
+  /** cap on simultaneous HTTP connections (default: unlimited) */
+  maxConnections?: number;
 }
 
 export interface RemoraHttpServer {
@@ -69,7 +73,8 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
   // our own body timer fires slightly before node's requestTimeout so the 408 envelope wins the race
   const bodyTimeoutMs = Math.max(1, Math.floor(opts.requestTimeoutMs * 0.9));
   let shuttingDown = false;
-  let poolListening = false;
+  // /health is unauthenticated: all callers share one pending probe so they cannot grow the pool's wait queue
+  let healthProbe: Promise<unknown> | undefined;
   let inflight = 0;
   let idle: (() => void) | undefined;
   let shutdownPromise: Promise<void> | undefined;
@@ -81,6 +86,7 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
   server.requestTimeout = opts.requestTimeoutMs;
   server.headersTimeout = Math.min(10_000, opts.requestTimeoutMs);
   server.keepAliveTimeout = 5000;
+  if (opts.maxConnections !== undefined) server.maxConnections = opts.maxConnections;
 
   function send(ctx: Ctx, status: number, body: unknown, headers: Record<string, string> = {}): void {
     const { res } = ctx;
@@ -217,12 +223,19 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
     if (shuttingDown) return send(ctx, 503, { status: 'shutting_down' });
     let timer: NodeJS.Timeout | undefined;
     try {
-      const probe = app.pool.query('SELECT 1');
-      probe.catch(() => undefined);
+      if (!healthProbe) {
+        const p = app.pool.query('SELECT 1');
+        const clear = (): void => {
+          if (healthProbe === p) healthProbe = undefined;
+        };
+        p.then(clear, clear);
+        healthProbe = p;
+      }
+      const probe = healthProbe;
       await Promise.race([
         probe,
         new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error('health probe timed out')), HEALTH_TIMEOUT_MS);
+          timer = setTimeout(() => reject(new Error('health probe timed out')), opts.healthTimeoutMs ?? HEALTH_TIMEOUT_MS);
         }),
       ]);
     } catch {
@@ -342,8 +355,6 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
   server.on('request', onRequest);
   server.on('error', (e) => logger.error('http server error', { error: e.message }));
 
-  const onPoolError = (e: Error): void => logger.error('database pool error', { error: e.message });
-
   return {
     server,
     async listen(port, host) {
@@ -355,10 +366,6 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
           resolve();
         });
       });
-      if (!poolListening) {
-        poolListening = true;
-        app.pool.on('error', onPoolError);
-      }
       return server.address() as AddressInfo;
     },
     shutdown() {
@@ -391,10 +398,6 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
           clearTimeout(grace);
         }
         await closed;
-        if (poolListening) {
-          poolListening = false;
-          app.pool.off('error', onPoolError);
-        }
       })());
     },
   };

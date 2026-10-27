@@ -20,7 +20,7 @@ describe('loadConfig', () => {
   it('applies defaults for a minimal env', () => {
     expect(loadConfig(base, '/work')).toEqual({
       databaseUrl: base.DATABASE_URL,
-      host: '0.0.0.0',
+      host: '127.0.0.1',
       port: 8080,
       secret,
       adminSecret: undefined,
@@ -29,6 +29,8 @@ describe('loadConfig', () => {
       requestTimeoutMs: 30000,
       statementTimeoutMs: 30000,
       shutdownTimeoutMs: 10000,
+      dbConnectTimeoutMs: 10000,
+      maxConnections: 1024,
       logLevel: 'info',
     });
   });
@@ -46,6 +48,8 @@ describe('loadConfig', () => {
         REMORA_REQUEST_TIMEOUT_MS: '5',
         REMORA_STATEMENT_TIMEOUT_MS: '0',
         REMORA_SHUTDOWN_TIMEOUT_MS: '7',
+        REMORA_DB_CONNECT_TIMEOUT_MS: '2500',
+        REMORA_MAX_CONNECTIONS: '64',
         LOG_LEVEL: 'debug',
       },
       '/work',
@@ -58,6 +62,8 @@ describe('loadConfig', () => {
       requestTimeoutMs: 5,
       statementTimeoutMs: 0,
       shutdownTimeoutMs: 7,
+      dbConnectTimeoutMs: 2500,
+      maxConnections: 64,
       logLevel: 'debug',
     });
     expect(c.pluginsDir).toMatch(/p$/);
@@ -91,6 +97,9 @@ describe('loadConfig', () => {
     ['REMORA_MAX_BODY_BYTES', '1.5'],
     ['REMORA_STATEMENT_TIMEOUT_MS', '-1'],
     ['REMORA_SHUTDOWN_TIMEOUT_MS', 'abc'],
+    ['REMORA_DB_CONNECT_TIMEOUT_MS', '0'],
+    ['REMORA_MAX_CONNECTIONS', '0'],
+    ['REMORA_MAX_CONNECTIONS', 'many'],
   ])('%s=%s is invalid_config', (variable, value) => {
     const e = fails({ ...base, [variable]: value });
     expect(e.code).toBe('invalid_config');

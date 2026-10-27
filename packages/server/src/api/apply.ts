@@ -36,6 +36,8 @@ export function mapPgError(e: unknown): RemoraError | null {
       return new RemoraError('concurrent_update', 'concurrent update, retry the batch');
     case '57014':
       return new RemoraError('timeout', 'statement timeout exceeded; the batch was rolled back, narrow the request');
+    case '54001': // statement too complex (stack depth), e.g. a hostile deeply nested value
+      return new RemoraError('invalid_param', 'a parameter is too deeply nested for the database');
     case '23503':
       return new RemoraError('invalid_param', 'referenced row does not exist');
     default:

@@ -24,6 +24,26 @@ function isJsonContentType(header: string | undefined): boolean {
   return header.split(';')[0]!.trim().toLowerCase() === 'application/json';
 }
 
+/** Deepest array/object nesting accepted in a request body. */
+export const MAX_JSON_DEPTH = 64;
+
+/** True when the JSON text nests arrays/objects deeper than `max`. Linear scan, no recursion, strings skipped. */
+export function exceedsJsonDepth(text: string, max: number): boolean {
+  let depth = 0;
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text.charCodeAt(i);
+    if (inString) {
+      if (c === 0x5c) i++; // backslash: skip the escaped character
+      else if (c === 0x22) inString = false;
+    } else if (c === 0x22) inString = true;
+    else if (c === 0x5b || c === 0x7b) {
+      if (++depth > max) return true;
+    } else if (c === 0x5d || c === 0x7d) depth--;
+  }
+  return false;
+}
+
 /**
  * Reads a JSON body. The size is counted while chunks arrive: a `Content-Length` over the limit
  * fails before any byte is read, and once the running total passes the limit buffering stops and
@@ -74,6 +94,9 @@ export function readJsonBody(req: http.IncomingMessage, limit: number, timeoutMs
         text = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
       } catch {
         return reject(new HttpError(400, 'invalid_param', 'request body is not valid UTF-8'));
+      }
+      if (exceedsJsonDepth(text, MAX_JSON_DEPTH)) {
+        return reject(new HttpError(400, 'invalid_param', `request body is nested deeper than ${MAX_JSON_DEPTH} levels`));
       }
       try {
         resolve(JSON.parse(text));
