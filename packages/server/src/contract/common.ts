@@ -124,8 +124,8 @@ export const relationSelectorProps: Record<string, JsonSchema> = {
 
 /** Exactly one of: relation_id, or all of type/from/to. */
 export const relationSelectorOneOf: JsonSchema[] = [
-  { required: ['relation_id'], properties: { relation_id: true } },
-  { required: ['type', 'from', 'to'], properties: { type: true, from: true, to: true } },
+  { required: ['relation_id'], properties: { relation_id: true, type: false, from: false, to: false } },
+  { required: ['type', 'from', 'to'], properties: { relation_id: false, type: true, from: true, to: true } },
 ];
 
 export const eventEntity: JsonSchema = {

@@ -70,14 +70,13 @@ function fieldOf(e: ErrorObject): string[] {
 function pickError(errors: ErrorObject[]): ErrorObject {
   const specific = errors.filter((e) => e.keyword !== 'oneOf' && e.keyword !== 'anyOf');
   const pool = specific.length > 0 ? specific : errors;
+  // deepest first; on ties prefer a concrete mismatch over "missing / extra property" noise from other branches
+  const rank = (e: ErrorObject): number => (e.keyword === 'required' || e.keyword === 'additionalProperties' ? 1 : 0);
   let best = pool[0]!;
-  let bestDepth = fieldOf(best).length;
   for (const e of pool) {
     const d = fieldOf(e).length;
-    if (d > bestDepth) {
-      best = e;
-      bestDepth = d;
-    }
+    const bd = fieldOf(best).length;
+    if (d > bd || (d === bd && rank(e) < rank(best))) best = e;
   }
   return best;
 }
@@ -89,7 +88,27 @@ function opError(index: number, errors: ErrorObject[]): ApiError {
   if (e.keyword === 'additionalProperties') {
     reason = `${reason}: ${(e.params as { additionalProperty: string }).additionalProperty}`;
   }
+  if (e.keyword === 'enum') {
+    const allowed = (e.params as { allowedValues: unknown[] }).allowedValues.map((v) => JSON.stringify(v)).join(', ');
+    reason = `${reason}: ${allowed}`;
+  }
   return invalid(index, `${field} ${reason}`, { field, reason });
+}
+
+const SELECTOR_OPS: ReadonlySet<string> = new Set(['end_relation', 'retract_relation']);
+const SELECTOR_KEYS: readonly string[] = ['relation_id', 'type', 'from', 'to'];
+const SELECTOR_REASON = 'give either relation_id or type/from/to, not both';
+
+/** end_relation / retract_relation: a precise message for a missing, partial or doubled selector. */
+function selectorError(index: number, errors: ErrorObject[]): ApiError | null {
+  const selectorOnly = errors.every(
+    (e) =>
+      e.keyword === 'oneOf' ||
+      e.keyword === 'false schema' ||
+      (e.keyword === 'required' && SELECTOR_KEYS.includes((e.params as { missingProperty: string }).missingProperty)),
+  );
+  if (!errors.some((e) => e.keyword === 'oneOf' && e.instancePath === '') || !selectorOnly) return null;
+  return invalid(index, `relation_id ${SELECTOR_REASON}`, { field: 'relation_id', reason: SELECTOR_REASON });
 }
 
 function validateRequest(body: unknown, validators: Map<string, ValidateFunction>): ApiError | null {
@@ -110,7 +129,7 @@ function validateRequest(body: unknown, validators: Map<string, ValidateFunction
   for (let i = 0; i < ops.length; i++) {
     const op: unknown = ops[i];
     if (typeof op !== 'object' || op === null || Array.isArray(op)) {
-      return invalid(i, 'op must be an object', { field: 'op', reason: 'must be an object' });
+      return invalid(i, `ops[${i}] must be an object`, { field: `ops[${i}]`, reason: 'must be an object' });
     }
     const name = (op as { op?: unknown }).op;
     if (name === undefined) {
@@ -121,7 +140,11 @@ function validateRequest(body: unknown, validators: Map<string, ValidateFunction
     }
     const validate = validators.get(name);
     if (!validate) return invalid(i, `unknown op: ${name}`, { op: name });
-    if (!validate(op)) return opError(i, validate.errors ?? []);
+    if (!validate(op)) {
+      const errors = validate.errors ?? [];
+      const sel = SELECTOR_OPS.has(name) ? selectorError(i, errors) : null;
+      return sel ?? opError(i, errors);
+    }
   }
   return null;
 }

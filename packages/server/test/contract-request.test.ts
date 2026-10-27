@@ -102,6 +102,7 @@ describe('validateApplyRequest', () => {
     expect(validateApplyRequest({ ops: [{ op: 'create_entity', key: 'a' }], extra: 1 })).toMatchObject({
       op_index: -1,
       code: 'invalid_param',
+      details: { field: 'extra' },
     });
   });
 
@@ -116,8 +117,8 @@ describe('validateApplyRequest', () => {
   });
 
   it('non-object op and missing / non-string op name', () => {
-    expect(apply(5)).toMatchObject({ op_index: 0, code: 'invalid_param' });
-    expect(apply([])).toMatchObject({ op_index: 0, code: 'invalid_param' });
+    expect(apply(5)).toMatchObject({ op_index: 0, code: 'invalid_param', details: { field: 'ops[0]' } });
+    expect(apply({ op: 'create_entity', key: 'a' }, [])).toMatchObject({ op_index: 1, details: { field: 'ops[1]' } });
     expect(apply({ key: 'a' })).toMatchObject({ op_index: 0, code: 'invalid_param', details: { field: 'op' } });
     expect(apply({ op: 5 })).toMatchObject({ op_index: 0, code: 'invalid_param', details: { field: 'op' } });
   });
@@ -151,22 +152,24 @@ describe('validateApplyRequest', () => {
       summary: 's',
       time: { axis: 'game_day', at: 1, extra: true },
     });
-    expect(e).toMatchObject({ op_index: 0, code: 'invalid_param' });
+    expect(e).toMatchObject({ op_index: 0, code: 'invalid_param', details: { field: 'time.extra' } });
     expect(apply({ op: 'add_event', summary: 's', time: { axis: 'g', at: 1 }, entities: [{ entity: 'a', who: 1 }] }))
-      .toMatchObject({ code: 'invalid_param' });
+      .toMatchObject({ code: 'invalid_param', details: { field: 'entities.0.who' } });
   });
 
   it('end_relation: relation_id xor type/from/to', () => {
     const t = { axis: 'game_day', at: 5 };
     expect(apply({ op: 'end_relation', relation_id: 1, time: t })).toBeNull();
     expect(apply({ op: 'end_relation', type: 'works_at', from: 'a', to: 'b', time: t })).toBeNull();
-    expect(apply({ op: 'end_relation', time: t })).toMatchObject({ code: 'invalid_param' });
-    expect(apply({ op: 'end_relation', type: 'works_at', from: 'a', time: t })).toMatchObject({
+    const both = {
       code: 'invalid_param',
-    });
-    expect(apply({ op: 'end_relation', relation_id: 1, type: 'w', from: 'a', to: 'b', time: t })).toMatchObject({
-      code: 'invalid_param',
-    });
+      details: { field: 'relation_id', reason: 'give either relation_id or type/from/to, not both' },
+    };
+    expect(apply({ op: 'end_relation', time: t })).toMatchObject(both);
+    expect(apply({ op: 'end_relation', type: 'works_at', from: 'a', time: t })).toMatchObject(both);
+    expect(apply({ op: 'end_relation', relation_id: 1, type: 'w', from: 'a', to: 'b', time: t })).toMatchObject(both);
+    expect(apply({ op: 'retract_relation', relation_id: 1, type: 'w' })).toMatchObject(both);
+    expect(apply({ op: 'end_relation', relation_id: 1 })).toMatchObject({ details: { field: 'time' } });
     expect(apply({ op: 'retract_relation', relation_id: 1 })).toBeNull();
     expect(apply({ op: 'retract_relation', type: 'w', from: 'a', to: 'b', axis: 'game_day' })).toBeNull();
   });
@@ -177,8 +180,12 @@ describe('validateApplyRequest', () => {
     expect(apply({ op: 'add_event', summary: 's', time: [{ axis: 'g', at: 1 }, { axis: 'h' }] })).toBeNull();
     expect(apply({ op: 'add_event', summary: 's', time: { axis: 'g', at: 1, from: 1 } })).toMatchObject({
       code: 'invalid_param',
+      details: { field: expect.stringMatching(/^time\.(from|at)$/) },
     });
-    expect(apply({ op: 'add_event', summary: 's', time: [] })).toMatchObject({ code: 'invalid_param' });
+    expect(apply({ op: 'add_event', summary: 's', time: [] })).toMatchObject({
+      code: 'invalid_param',
+      details: { field: 'time' },
+    });
     expect(apply({ op: 'add_event', summary: 's' })).toMatchObject({ details: { field: 'time' } });
   });
 
@@ -187,14 +194,18 @@ describe('validateApplyRequest', () => {
     expect(apply({ op: 'update_event', id: 1, keywords: { set: ['a'] } })).toBeNull();
     expect(apply({ op: 'update_event', id: 1, keywords: { add: ['a'], remove: ['b'] } })).toBeNull();
     expect(apply({ op: 'update_event', id: 1, entities: { add: [{ entity: 'a', role: 'who' }] } })).toBeNull();
-    expect(apply({ op: 'update_event', id: 1, keywords: ['a'] })).toMatchObject({ code: 'invalid_param' });
-    expect(apply({ op: 'update_event', id: 1, entities: { drop: [] } })).toMatchObject({ code: 'invalid_param' });
+    expect(apply({ op: 'update_event', id: 1, keywords: ['a'] })).toMatchObject({ details: { field: 'keywords' } });
+    expect(apply({ op: 'update_event', id: 1, entities: { drop: [] } })).toMatchObject({
+      details: { field: 'entities.drop' },
+    });
   });
 
   it('create_property_type value_type enum', () => {
     const base = { op: 'create_property_type', name: 'n', description: 'd', single_valued: true };
     expect(apply({ ...base, value_type: 'text' })).toBeNull();
-    expect(apply({ ...base, value_type: 'blob' })).toMatchObject({ details: { field: 'value_type' } });
+    const e = apply({ ...base, value_type: 'blob' });
+    expect(e).toMatchObject({ details: { field: 'value_type' } });
+    expect(String(e?.details?.reason)).toContain('"bool"');
   });
 
   it('as must be a non-empty name without $', () => {
@@ -259,7 +270,11 @@ describe('validateQueryRequest', () => {
   });
 
   it('no as on query ops', () => {
-    expect(query({ op: 'get_entity', key: 'bob', as: 'x' })).toMatchObject({ op_index: 0, code: 'invalid_param' });
+    expect(query({ op: 'get_entity', key: 'bob', as: 'x' })).toMatchObject({
+      op_index: 0,
+      code: 'invalid_param',
+      details: { field: 'as' },
+    });
   });
 
   it('neighbors bounds and enums', () => {
@@ -267,7 +282,9 @@ describe('validateQueryRequest', () => {
     expect(query({ ...base, depth: 6 })).toBeNull();
     expect(query({ ...base, depth: 7 })).toMatchObject({ details: { field: 'depth' } });
     expect(query({ ...base, depth: 0 })).toMatchObject({ details: { field: 'depth' } });
-    expect(query({ ...base, direction: 'sideways' })).toMatchObject({ details: { field: 'direction' } });
+    const d = query({ ...base, direction: 'sideways' });
+    expect(d).toMatchObject({ details: { field: 'direction' } });
+    expect(String(d?.details?.reason)).toContain('"both"');
     expect(query({ ...base, order_by: { property: 'h', dir: 'up' } })).toMatchObject({
       details: { field: 'order_by.dir' },
     });
@@ -292,9 +309,12 @@ describe('validateQueryRequest', () => {
     expect(query({ ...p, when: { axis: 'g', at: 1 } })).toBeNull();
     expect(query({ ...p, when: { axis: 'g', during: [1, 2] } })).toBeNull();
     expect(query({ ...p, when: { axis: 'g', during: [null, 2] } })).toBeNull();
-    expect(query({ ...p, when: { axis: 'g', at: 1, during: [1, 2] } })).toMatchObject({ code: 'invalid_param' });
-    expect(query({ ...p, when: { axis: 'g', during: [1] } })).toMatchObject({ code: 'invalid_param' });
-    expect(query({ ...p, when: { axis: 'g' } })).toMatchObject({ code: 'invalid_param' });
+    expect(query({ ...p, when: { axis: 'g', at: 1, during: [1, 2] } })).toMatchObject({
+      code: 'invalid_param',
+      details: { field: expect.stringMatching(/^when\.(at|during)$/) },
+    });
+    expect(query({ ...p, when: { axis: 'g', during: [1] } })).toMatchObject({ details: { field: 'when.during' } });
+    expect(query({ ...p, when: { axis: 'g' } })).toMatchObject({ code: 'invalid_param', details: { field: 'when.at' } });
     expect(query({ ...p, when: { axis: 'g', from: 1 } })).toMatchObject({ code: 'invalid_param' });
   });
 
@@ -306,5 +326,46 @@ describe('validateQueryRequest', () => {
   it('ids', () => {
     expect(query({ op: 'get_event', id: 0 })).toMatchObject({ details: { field: 'id' } });
     expect(query({ op: 'get_evidence', id: 1.5 })).toMatchObject({ details: { field: 'id' } });
+  });
+});
+
+describe('request schemas agree with the hand validator (drift)', () => {
+  const opts = { strict: true, allowUnionTypes: true, allErrors: true } as const;
+  const applyAjv = new Ajv(opts).compile(applyRequestSchema);
+  const queryAjv = new Ajv(opts).compile(queryRequestSchema);
+  const many = (op: object) => Array.from({ length: MAX_OPS + 1 }, () => op);
+
+  const applyBodies: unknown[] = [
+    { ops: [{ op: 'create_entity', key: 'a' }] },
+    { ops: Object.values(APPLY_OPS).map((s) => (s.examples as unknown[])[0]) },
+    {},
+    { ops: [] },
+    { ops: 'x' },
+    { ops: [{ op: 'frobnicate' }] },
+    { ops: [{ op: 'create_entity' }] },
+    { ops: [{ op: 'create_entity', key: 'a', extra: 1 }] },
+    { ops: [{ op: 'create_entity', key: 'a' }], extra: 1 },
+    { ops: many({ op: 'create_entity', key: 'a' }) },
+    { ops: [5] },
+  ];
+  const queryBodies: unknown[] = [
+    { ops: [{ op: 'get_entity', key: 'a' }] },
+    { ops: Object.values(QUERY_OPS).map((s) => (s.examples as unknown[])[0]) },
+    {},
+    { ops: [] },
+    { ops: [{ op: 'create_entity', key: 'a' }] },
+    { ops: [{ op: 'neighbors', entity: 'a', depth: '2' }] },
+    { ops: many({ op: 'list_time_axes' }) },
+  ];
+
+  it('apply', () => {
+    for (const b of applyBodies) {
+      expect(applyAjv(b), JSON.stringify(b).slice(0, 80)).toBe(validateApplyRequest(b) === null);
+    }
+  });
+  it('query', () => {
+    for (const b of queryBodies) {
+      expect(queryAjv(b), JSON.stringify(b).slice(0, 80)).toBe(validateQueryRequest(b) === null);
+    }
   });
 });

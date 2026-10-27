@@ -79,7 +79,7 @@ export const APPLY_OPS: Record<ApplyOpName, JsonSchema> = {
   ),
   update_event: write(
     'update_event',
-    'Change an existing event. Give only the fields to change (at least one besides id): "summary"; "details" (a string, or null to clear); "keywords" as {set: [...]} to replace or {add?, remove?} to adjust; "time" to replace the event\'s times; "entities" as {add?, remove?}. Returns the event. Errors: not_found, invalid_param.',
+    'Change an existing event. Give only the fields to change (at least one besides id): "summary"; "details" (a string, or null to clear); "keywords" as {set: [...]} to replace or {add?, remove?} to adjust; "time" to replace the event\'s times; "entities" as {add?, remove?}. Returns {id}. Errors: not_found, invalid_param.',
     { op: 'update_event', id: 12, keywords: { add: ['celebration'] }, entities: { add: [{ entity: 'carl', role: 'witness' }] } },
     {
       id: idProp('event'),
@@ -111,7 +111,7 @@ export const APPLY_OPS: Record<ApplyOpName, JsonSchema> = {
   ),
   retract_event: write(
     'retract_event',
-    'Retract an event that was recorded by mistake. The event disappears from search results but stays in the audit trail. Errors: not_found.',
+    'Retract an event that was recorded by mistake. The event disappears from search results but stays in the audit trail. Returns {id}. Errors: not_found.',
     { op: 'retract_event', id: 12 },
     { id: idProp('event'), evidence },
     ['id'],
@@ -125,7 +125,7 @@ export const APPLY_OPS: Record<ApplyOpName, JsonSchema> = {
   ),
   add_property: write(
     'add_property',
-    "Add a value of a property to an entity. For single-valued property types a new value must not overlap an existing one on the same axis (single_valued_conflict); multi-valued types accumulate. \"time\" is the validity interval {axis, from?, to?} (from inclusive, to exclusive), or a list with one entry per axis; omit it for a timeless fact. \"value\" is any JSON value (null is allowed) but must match the property type's value_type. Use replace_property to supersede the current value. Returns {id}. Errors: unknown_entity, unknown_type, value_type_mismatch, single_valued_conflict, timeless_conflict, invalid_time.",
+    "Add a value of a property to an entity. For single-valued property types a new value must not overlap an existing one on the same axis (single_valued_conflict); multi-valued types accumulate. \"time\" is the validity interval {axis, from?, to?} (from inclusive, to exclusive), or a list with one entry per axis; omit it for a timeless fact. \"value\" is any JSON value (null is allowed) but must match the property type's value_type. Use replace_property to supersede the current value. Returns {ids: [...]} with one version id per axis span (use an id with retract_property). Errors: unknown_entity, unknown_type, value_type_mismatch, single_valued_conflict, timeless_conflict, invalid_time.",
     { op: 'add_property', entity: 'bob', property: 'height', value: 186, time: { axis: 'game_day', from: 100 } },
     {
       entity: entityRef,
@@ -138,7 +138,7 @@ export const APPLY_OPS: Record<ApplyOpName, JsonSchema> = {
   ),
   replace_property: write(
     'replace_property',
-    'Supersede the current value: open values of the property are closed at the given moment and the new value starts there. "time" is {axis, at}. Returns {id} of the new version. Errors: unknown_entity, unknown_type, value_type_mismatch, invalid_time.',
+    'Supersede the current value: open values of the property are closed at the given moment and the new value starts there. "time" is {axis, at}. Returns {closed: [ids of versions that were closed], retracted: [ids of versions that were retracted], ids: [id of the new version]}. Errors: unknown_entity, unknown_type, value_type_mismatch, invalid_time.',
     { op: 'replace_property', entity: 'bob', property: 'job_title', value: 'Senior', time: { axis: 'game_day', at: 292 } },
     {
       entity: entityRef,
@@ -151,21 +151,21 @@ export const APPLY_OPS: Record<ApplyOpName, JsonSchema> = {
   ),
   end_property: write(
     'end_property',
-    'Close the open values of a property at the given moment without adding a new one ("Bob no longer has a job"). "time" {axis, at} is required. Errors: unknown_entity, unknown_type, invalid_time.',
+    'Close the open values of a property at the given moment without adding a new one ("Bob no longer has a job"). "time" {axis, at} is required. Returns {closed: [ids of the closed versions]}. Errors: unknown_entity, unknown_type, invalid_time.',
     { op: 'end_property', entity: 'bob', property: 'job_title', time: { axis: 'game_day', at: 300 } },
     { entity: entityRef, property: text('Property type name.'), time: momentTime, evidence },
     ['entity', 'property', 'time'],
   ),
   retract_property: write(
     'retract_property',
-    'Retract a property version that was recorded by mistake (by the id from add_property or property_history). It stays in the audit trail but no longer counts as a fact. Errors: not_found.',
+    'Retract a property version that was recorded by mistake (by an id from the "ids" returned by add_property / replace_property, or from property_history). It stays in the audit trail but no longer counts as a fact. Returns {id}. Errors: not_found.',
     { op: 'retract_property', id: 41 },
     { id: idProp('property version'), evidence },
     ['id'],
   ),
   add_relation: write(
     'add_relation',
-    'Connect two entities with a relation of the given type (see list_relation_types). For directed types the relation goes from "from" to "to". "time" is the validity interval {axis, from?, to?} or a list with one entry per axis; omit it for a timeless relation. Returns {relation_id, ...}. Errors: unknown_entity, unknown_type, invalid_time.',
+    'Connect two entities with a relation of the given type (see list_relation_types). For directed types the relation goes from "from" to "to". "time" is the validity interval {axis, from?, to?} or a list with one entry per axis; omit it for a timeless relation. Returns {relation_id, ids: [version ids]}. Errors: unknown_entity, unknown_type, invalid_time.',
     { op: 'add_relation', type: 'works_at', from: 'bob', to: 'google', time: { axis: 'game_day', from: 292 } },
     {
       type: text('Relation type name.'),
@@ -178,7 +178,7 @@ export const APPLY_OPS: Record<ApplyOpName, JsonSchema> = {
   ),
   end_relation: write(
     'end_relation',
-    'End a relation at the given moment. Identify it by "relation_id", or by the selector type + from + to (all three, not mixed with relation_id). "time" {axis, at} is required. Errors: not_found, unknown_entity, unknown_type, invalid_time.',
+    'End a relation at the given moment. Identify it by "relation_id", or by the selector type + from + to (all three, not mixed with relation_id). "time" {axis, at} is required. Returns {closed: [ids of the closed versions]}. Errors: not_found, unknown_entity, unknown_type, invalid_time.',
     { op: 'end_relation', type: 'works_at', from: 'bob', to: 'google', time: { axis: 'game_day', at: 400 } },
     { ...relationSelectorProps, time: momentTime, evidence },
     ['time'],
@@ -186,7 +186,7 @@ export const APPLY_OPS: Record<ApplyOpName, JsonSchema> = {
   ),
   retract_relation: write(
     'retract_relation',
-    'Retract a relation that was recorded by mistake: all its time versions, or only those on one axis when "axis" is given. Identify it by "relation_id", or by the selector type + from + to (all three, not mixed with relation_id). Errors: not_found, unknown_axis.',
+    'Retract a relation that was recorded by mistake: all its time versions, or only those on one axis when "axis" is given. Identify it by "relation_id", or by the selector type + from + to (all three, not mixed with relation_id). Returns {retracted: [ids of the retracted versions]}. Errors: not_found, unknown_axis.',
     { op: 'retract_relation', relation_id: 12 },
     {
       ...relationSelectorProps,
