@@ -1,6 +1,6 @@
 import { RemoraError, type RetentionAction, type RetentionRow } from '@remora/sdk';
 import type pg from 'pg';
-import { rollback } from '../api/apply.js';
+import { mapPgError, rollback } from '../api/apply.js';
 import type { Queryable } from '../db/types.js';
 import type { PluginRegistry, SourceInfo } from '../plugins/registry.js';
 
@@ -39,6 +39,19 @@ function isThenable(x: unknown): boolean {
   return typeof x === 'object' && x !== null && typeof (x as { then?: unknown }).then === 'function';
 }
 
+/** Maintenance entry points throw RemoraError only: DB errors from the API contract are mapped. */
+async function guarded<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e) {
+    if (e instanceof RemoraError) throw e;
+    throw mapPgError(e) ?? e;
+  }
+}
+
+/** Largest value of a Postgres bigint. */
+const MAX_BIGINT = 2n ** 63n - 1n;
+
 type Planned = { id: bigint; action: 'keep' } | { id: bigint; action: 'purge' } | {
   id: bigint;
   action: 'replace';
@@ -50,13 +63,6 @@ type Planned = { id: bigint; action: 'keep' } | { id: bigint; action: 'purge' } 
 function validatePlan(source: string, ids: Set<bigint>, plan: unknown): Planned[] {
   const bad = (why: string): RemoraError =>
     new RemoraError('invalid_plugin', `planRetention of source ${source} ${why}`, { source });
-  if (isThenable(plan)) {
-    (plan as Promise<unknown>).catch(() => undefined);
-    throw bad('must be synchronous');
-  }
-  if (!Array.isArray(plan)) throw bad('did not return an array');
-  const seen = new Set<bigint>();
-  const out: Planned[] = [];
   const json = (v: unknown): string => {
     let j: string | undefined;
     try {
@@ -67,27 +73,48 @@ function validatePlan(source: string, ids: Set<bigint>, plan: unknown): Planned[
     if (j === undefined) throw bad('returned a value that is not JSON-serializable');
     return j;
   };
-  for (const raw of plan as unknown[]) {
-    if (typeof raw !== 'object' || raw === null) throw bad('returned a malformed action');
-    const a = raw as Partial<RetentionAction> & { payload?: unknown; retentionState?: unknown };
-    if (typeof a.id !== 'bigint' || !ids.has(a.id)) throw bad('returned an action for an id outside the batch');
-    if (seen.has(a.id)) throw bad('returned two actions for one id');
-    seen.add(a.id);
-    if (a.action === 'keep' || a.action === 'purge') {
-      out.push({ id: a.id, action: a.action });
-    } else if (a.action === 'replace') {
-      if (a.payload === undefined) throw bad('returned replace without a payload');
-      out.push({
-        id: a.id,
-        action: 'replace',
-        payload: json(a.payload),
-        retentionState: a.retentionState === undefined || a.retentionState === null ? null : json(a.retentionState),
-      });
-    } else {
-      throw bad('returned an unknown action');
+  try {
+    if (isThenable(plan)) {
+      try {
+        Promise.resolve(plan).catch(() => {});
+      } catch {
+        // a hostile then() must not mask the invalid_plugin error
+      }
+      throw bad('must be synchronous');
     }
+    if (!Array.isArray(plan)) throw bad('did not return an array');
+    const seen = new Set<bigint>();
+    const out: Planned[] = [];
+    for (const raw of plan as unknown[]) {
+      if (typeof raw !== 'object' || raw === null) throw bad('returned a malformed action');
+      const a = raw as Partial<RetentionAction> & { payload?: unknown; retentionState?: unknown };
+      // read each plugin-controlled property exactly once (getters may throw or change)
+      const id = a.id;
+      const action = a.action;
+      if (typeof id !== 'bigint' || !ids.has(id)) throw bad('returned an action for an id outside the batch');
+      if (seen.has(id)) throw bad('returned two actions for one id');
+      seen.add(id);
+      if (action === 'keep' || action === 'purge') {
+        out.push({ id, action });
+      } else if (action === 'replace') {
+        const payload = a.payload;
+        const retentionState = a.retentionState;
+        if (payload === undefined || payload === null) throw bad('returned replace without a payload');
+        out.push({
+          id,
+          action: 'replace',
+          payload: json(payload),
+          retentionState: retentionState === undefined || retentionState === null ? null : json(retentionState),
+        });
+      } else {
+        throw bad('returned an unknown action');
+      }
+    }
+    return out;
+  } catch (e) {
+    if (e instanceof RemoraError) throw e;
+    throw bad('returned an unreadable result');
   }
-  return out;
 }
 
 async function retainSource(
@@ -108,7 +135,7 @@ async function retainSource(
       }>(
         `SELECT id, payload, retention_state, created_at FROM evidence_log
           WHERE source_id = $1 AND NOT pinned AND purged_at IS NULL AND id > $2::bigint
-          ORDER BY id LIMIT $3 FOR UPDATE`,
+          ORDER BY id LIMIT $3 FOR NO KEY UPDATE`,
         [info.id, last, batchSize],
       );
       if (r.rows.length === 0) return 0;
@@ -118,9 +145,21 @@ async function retainSource(
         retentionState: x.retention_state,
         createdAt: x.created_at,
       }));
+      // The allowed ids come from our own rows; the plugin only ever sees frozen copies.
+      const allowed = new Set(rows.map((x) => x.id));
+      const given = Object.freeze(
+        rows.map((x) =>
+          Object.freeze({
+            id: x.id,
+            payload: structuredClone(x.payload),
+            retentionState: structuredClone(x.retentionState),
+            createdAt: new Date(x.createdAt.getTime()),
+          }),
+        ),
+      );
       let plan: unknown;
       try {
-        plan = info.def.planRetention(rows, now);
+        plan = info.def.planRetention(given as RetentionRow[], new Date(now.getTime()));
       } catch (e) {
         if (e instanceof RemoraError) throw e;
         throw new RemoraError('invalid_plugin', `planRetention of source ${info.name} threw`, {
@@ -128,24 +167,35 @@ async function retainSource(
           reason: e instanceof Error ? e.message : String(e),
         });
       }
-      const actions = validatePlan(info.name, new Set(rows.map((x) => x.id)), plan);
+      const actions = validatePlan(info.name, allowed, plan);
       let replaced = 0;
       let purged = 0;
-      for (const a of actions) {
-        if (a.action === 'purge') {
-          await db.query(
-            `UPDATE evidence_log SET payload = NULL, retention_state = NULL, purged_at = now() WHERE id = $1`,
-            [a.id.toString()],
-          );
-          purged++;
-        } else if (a.action === 'replace') {
-          await db.query(`UPDATE evidence_log SET payload = $2::jsonb, retention_state = $3::jsonb WHERE id = $1`, [
-            a.id.toString(),
-            a.payload,
-            a.retentionState,
-          ]);
-          replaced++;
+      try {
+        for (const a of actions) {
+          if (a.action === 'purge') {
+            await db.query(
+              `UPDATE evidence_log SET payload = NULL, retention_state = NULL, purged_at = now() WHERE id = $1`,
+              [a.id.toString()],
+            );
+            purged++;
+          } else if (a.action === 'replace') {
+            await db.query(`UPDATE evidence_log SET payload = $2::jsonb, retention_state = $3::jsonb WHERE id = $1`, [
+              a.id.toString(),
+              a.payload,
+              a.retentionState,
+            ]);
+            replaced++;
+          }
         }
+      } catch (e) {
+        // a class-22 error here means the plugin handed us a value jsonb cannot store
+        const code = (e as { code?: unknown } | null)?.code;
+        if (typeof code === 'string' && code.startsWith('22')) {
+          throw new RemoraError('invalid_plugin', `planRetention of source ${info.name} returned an unstorable value`, {
+            source: info.name,
+          });
+        }
+        throw e;
       }
       // counters only change once the whole batch is validated and applied
       report.processed += rows.length;
@@ -155,21 +205,33 @@ async function retainSource(
       last = r.rows[r.rows.length - 1]!.id;
       return rows.length;
     });
-    if (n < batchSize) return;
+    // stop only on an empty batch: rows may be added between batches
+    if (n === 0) return;
   }
 }
 
 /** R18: apply each source's retention plan in batches, one transaction per batch. */
-export async function applyRetention(
+export function applyRetention(
   pool: pg.Pool,
   registry: PluginRegistry,
   a: { source?: string; batchSize?: number; now?: Date } = {},
+): Promise<RetentionReport> {
+  return guarded(() => applyRetentionInner(pool, registry, a));
+}
+
+async function applyRetentionInner(
+  pool: pg.Pool,
+  registry: PluginRegistry,
+  a: { source?: string; batchSize?: number; now?: Date },
 ): Promise<RetentionReport> {
   const batchSize = a.batchSize ?? RETENTION_BATCH;
   if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > MAX_BATCH) {
     throw new RemoraError('invalid_param', `batchSize must be an integer from 1 to ${MAX_BATCH}`, {
       field: 'batchSize',
     });
+  }
+  if (a.now !== undefined && (!(a.now instanceof Date) || Number.isNaN(a.now.getTime()))) {
+    throw new RemoraError('invalid_param', 'now must be a valid Date', { field: 'now' });
   }
   const now = a.now ?? new Date();
   const report: RetentionReport = { processed: 0, kept: 0, replaced: 0, purged: 0, skipped: [] };
@@ -189,12 +251,25 @@ export async function applyRetention(
 const PURGE_SET = `payload = NULL, retention_state = NULL, purged_at = now()`;
 
 /** R19: manual purge by ids or by source and age; pinned rows are skipped and counted. */
-export async function purgeEvidence(
-  pool: pg.Pool,
-  a: PurgeArgs,
-): Promise<{ purged: number; skippedPinned: number }> {
-  if ('ids' in a) {
-    if (!Array.isArray(a.ids) || a.ids.length === 0 || a.ids.some((i) => typeof i !== 'bigint' || i < 1n)) {
+export function purgeEvidence(pool: pg.Pool, a: PurgeArgs): Promise<{ purged: number; skippedPinned: number }> {
+  return guarded(() => purgeEvidenceInner(pool, a));
+}
+
+async function purgeEvidenceInner(pool: pg.Pool, a: PurgeArgs): Promise<{ purged: number; skippedPinned: number }> {
+  const o = a as { ids?: unknown; source?: unknown; olderThan?: unknown };
+  const hasIds = o.ids !== undefined;
+  const hasAge = o.source !== undefined || o.olderThan !== undefined;
+  if (hasIds === hasAge) {
+    throw new RemoraError('invalid_param', 'give either ids or source with olderThan, not both and not neither', {
+      field: hasIds ? 'ids' : 'source',
+    });
+  }
+  if (hasIds && 'ids' in a) {
+    if (
+      !Array.isArray(a.ids) ||
+      a.ids.length === 0 ||
+      a.ids.some((i) => typeof i !== 'bigint' || i < 1n || i > MAX_BIGINT)
+    ) {
       throw new RemoraError('invalid_param', 'ids must be a non-empty array of positive ids', { field: 'ids' });
     }
     const ids = [...new Set(a.ids.map((i) => i.toString()))];
@@ -223,16 +298,18 @@ export async function purgeEvidence(
     }
     return { purged, skippedPinned };
   }
-  if (typeof a.source !== 'string' || !(a.olderThan instanceof Date) || Number.isNaN(a.olderThan.getTime())) {
-    throw new RemoraError('invalid_param', 'source and a valid olderThan are required');
+  if (typeof o.source !== 'string' || !(o.olderThan instanceof Date) || Number.isNaN(o.olderThan.getTime())) {
+    throw new RemoraError('invalid_param', 'source and a valid olderThan are required', {
+      field: typeof o.source !== 'string' ? 'source' : 'olderThan',
+    });
   }
-  const src = await pool.query<{ id: number }>('SELECT id FROM evidence_source WHERE name = $1', [a.source]);
-  if (src.rows.length === 0) throw new RemoraError('unknown_source', `unknown evidence source ${a.source}`);
+  const src = await pool.query<{ id: number }>('SELECT id FROM evidence_source WHERE name = $1', [o.source]);
+  if (src.rows.length === 0) throw new RemoraError('unknown_source', `unknown evidence source ${o.source}`);
   const sourceId = src.rows[0]!.id;
   const pinnedCount = await pool.query(
     `SELECT count(*)::int AS n FROM evidence_log
       WHERE source_id = $1 AND created_at < $2 AND pinned AND purged_at IS NULL`,
-    [sourceId, a.olderThan],
+    [sourceId, o.olderThan],
   );
   let purged = 0;
   for (;;) {
@@ -242,7 +319,7 @@ export async function purgeEvidence(
            SELECT id FROM evidence_log
             WHERE source_id = $1 AND created_at < $2 AND NOT pinned AND purged_at IS NULL
             ORDER BY id LIMIT $3 FOR UPDATE)`,
-        [sourceId, a.olderThan, PURGE_BATCH],
+        [sourceId, o.olderThan, PURGE_BATCH],
       );
       return u.rowCount ?? 0;
     });
@@ -252,9 +329,15 @@ export async function purgeEvidence(
   return { purged, skippedPinned: pinnedCount.rows[0].n };
 }
 
-async function setPinned(db: Queryable, id: bigint, pinned: boolean): Promise<void> {
-  const r = await db.query('UPDATE evidence_log SET pinned = $2 WHERE id = $1 RETURNING id', [id.toString(), pinned]);
-  if (r.rows.length === 0) throw new RemoraError('not_found', `evidence ${id} not found`, { id: Number(id) });
+/** Pinning a purged row is allowed: it only sets the flag, there is nothing left to protect. */
+function setPinned(db: Queryable, id: bigint, pinned: boolean): Promise<void> {
+  return guarded(async () => {
+    if (typeof id !== 'bigint' || id < 1n || id > MAX_BIGINT) {
+      throw new RemoraError('invalid_param', 'id must be a positive evidence id', { field: 'id' });
+    }
+    const r = await db.query('UPDATE evidence_log SET pinned = $2 WHERE id = $1 RETURNING id', [id.toString(), pinned]);
+    if (r.rows.length === 0) throw new RemoraError('not_found', `evidence ${id} not found`, { id: Number(id) });
+  });
 }
 
 export const pinEvidence = (db: Queryable, id: bigint): Promise<void> => setPinned(db, id, true);

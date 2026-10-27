@@ -34,6 +34,14 @@ const odd: Record<string, ReturnType<typeof fakeSource>> = {
   retbig: fakeSource('retbig', { ingest: () => ({ payload: {}, retentionState: 1n }) }),
   asyncy: fakeSource('asyncy', { ingest: (async () => ({ payload: {} })) as never }),
   asyncrej: fakeSource('asyncrej', { ingest: (async () => Promise.reject(new Error('r'))) as never }),
+  thenable: fakeSource('thenable', { ingest: (() => ({ then: () => undefined })) as never }),
+  getter: fakeSource('getter', {
+    ingest: (() => ({
+      get payload(): unknown {
+        throw new Error('getter boom');
+      },
+    })) as never,
+  }),
 };
 
 const ALL = ['chat', 'raw', 'boom', 'passthru', 'badplug', ...Object.keys(odd), 'down'];

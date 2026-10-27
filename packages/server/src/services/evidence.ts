@@ -51,13 +51,26 @@ export async function addEvidence(
   }
   const badPlugin = (why: string): RemoraError =>
     new RemoraError('invalid_plugin', `ingest of source ${a.source} ${why}`, { source: a.source });
-  if (isThenable(out)) {
-    out.catch(() => undefined);
-    throw badPlugin('must be synchronous');
+  // The plugin result is untrusted: every property access below may throw (getters, proxies).
+  let outPayload: unknown;
+  let outRetention: unknown;
+  try {
+    if (isThenable(out)) {
+      try {
+        Promise.resolve(out).catch(() => {});
+      } catch {
+        // a hostile then() must not mask the invalid_plugin error
+      }
+      throw badPlugin('must be synchronous');
+    }
+    if (typeof out !== 'object' || out === null) throw badPlugin('returned no payload');
+    outPayload = out.payload;
+    outRetention = out.retentionState;
+  } catch (e) {
+    if (e instanceof RemoraError) throw e;
+    throw badPlugin('returned an unreadable result');
   }
-  if (typeof out !== 'object' || out === null || out.payload === undefined) {
-    throw badPlugin('returned no payload');
-  }
+  if (outPayload === undefined) throw badPlugin('returned no payload');
   const json = (v: unknown): string | null => {
     let j: string | undefined;
     try {
@@ -68,8 +81,8 @@ export async function addEvidence(
     if (j === undefined) throw badPlugin('returned a value that is not JSON-serializable');
     return j;
   };
-  const payloadJson = json(out.payload);
-  const retentionJson = out.retentionState === undefined ? null : json(out.retentionState);
+  const payloadJson = json(outPayload);
+  const retentionJson = outRetention === undefined ? null : json(outRetention);
   const r = await db.query<{ id: string }>(
     `INSERT INTO evidence_log (source_id, payload, retention_state)
      VALUES ($1, $2::jsonb, $3::jsonb) RETURNING id`,
