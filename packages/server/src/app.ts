@@ -1,5 +1,5 @@
+import { join } from 'node:path';
 import pg from 'pg';
-import corePlugin from '@remora/core-plugin';
 import { apply, type ApplyResponse } from './api/apply.js';
 import { query, type QueryResponse } from './api/query.js';
 import { runMigrations } from './db/migrate.js';
@@ -15,11 +15,11 @@ import {
   addPlugin,
   CORE_PLUGIN_NAME,
   loadPlugins,
-  defaultImporter,
   type Importer,
   type Logger,
   type PluginRegistry,
 } from './plugins/registry.js';
+import { pluginImporter } from './plugins/resolve.js';
 
 export interface StartOptions {
   databaseUrl: string;
@@ -35,6 +35,8 @@ export interface StartOptions {
 export interface RemoraApp {
   pool: pg.Pool;
   registry: PluginRegistry;
+  importer: Importer;
+  addPlugin(a: { package: string }): Promise<{ id: number; name: string }>;
   apply(request: unknown): Promise<ApplyResponse>;
   query(request: unknown): Promise<QueryResponse>;
   applyRetention(a?: { source?: string; batchSize?: number; now?: Date }): Promise<RetentionReport>;
@@ -44,21 +46,20 @@ export interface RemoraApp {
   close(): Promise<void>;
 }
 
-const bundledImporter: Importer = async (spec) =>
-  spec === '@remora/core-plugin' ? corePlugin : defaultImporter(spec);
-
 export async function startRemora(opts: StartOptions): Promise<RemoraApp> {
   const pool = new pg.Pool({
     connectionString: opts.databaseUrl,
     ...(opts.statementTimeoutMs !== undefined ? { statement_timeout: opts.statementTimeoutMs } : {}),
   });
   try {
-    const importer = opts.importer ?? bundledImporter;
+    const importer = opts.importer ?? pluginImporter(opts.pluginsDir ?? join(process.cwd(), 'plugins'));
     const registry = await startUnderLock(pool, opts, importer);
     let closing: Promise<void> | undefined;
     return {
       pool,
       registry,
+      importer,
+      addPlugin: (a) => addPlugin(pool, a, importer),
       apply: (request) => apply(pool, registry, request),
       query: (request) => query(pool, registry, request),
       applyRetention: (a) => applyRetention(pool, registry, a),
