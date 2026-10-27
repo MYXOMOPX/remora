@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { definePlugin, RemoraError, type PluginDef, type TimeAxisDef } from '@remora/sdk';
 import { runMigrations } from '../src/db/migrate.js';
 import { addPlugin, loadPlugins, type Importer } from '../src/plugins/registry.js';
+import { fakeSource } from './helpers/axes.js';
 import { createTestDb } from './helpers/testDb.js';
 
 async function withDb(fn: (pool: pg.Pool) => Promise<void>): Promise<void> {
@@ -348,17 +349,13 @@ describe('plugin registry', () => {
   });
 
   describe('evidence source lookup', () => {
-    const src = (name: string, over: Record<string, unknown> = {}) => ({
-      name, description: 'd', payloadSchema: { type: 'object' },
-      ingest: (payload: unknown) => ({ payload }), planRetention: () => [], ...over,
-    });
     const withSources = (name: string, sources: unknown[]) =>
       plug(name, [], { setup: () => ({ evidenceSources: sources as never }) });
 
     it('getSource / listSources return served sources', async () => {
       await withDb(async (pool) => {
         await insertPlugin(pool, 'fake-a');
-        const reg = await loadPlugins(pool, { importer: importerOf({ 'fake-a': withSources('fake-a', [src('chat')]) }) });
+        const reg = await loadPlugins(pool, { importer: importerOf({ 'fake-a': withSources('fake-a', [fakeSource('chat')]) }) });
         const row = await pool.query<{ id: number }>(`SELECT id FROM evidence_source WHERE name = 'chat'`);
         const s = reg.getSource('chat');
         expect(s.name).toBe('chat');
@@ -389,7 +386,7 @@ describe('plugin registry', () => {
     it('a source no longer declared is source_unavailable', async () => {
       await withDb(async (pool) => {
         await insertPlugin(pool, 'fake-a');
-        await loadPlugins(pool, { importer: importerOf({ 'fake-a': withSources('fake-a', [src('old_src')]) }) });
+        await loadPlugins(pool, { importer: importerOf({ 'fake-a': withSources('fake-a', [fakeSource('old_src')]) }) });
         const reg = await loadPlugins(pool, { importer: importerOf({ 'fake-a': withSources('fake-a', []) }) });
         expect(() => reg.getSource('old_src')).toThrow(code('source_unavailable'));
       });
@@ -399,7 +396,7 @@ describe('plugin registry', () => {
       await withDb(async (pool) => {
         await insertPlugin(pool, 'fake-a');
         const reg = await loadPlugins(pool, {
-          importer: importerOf({ 'fake-a': withSources('fake-a', [src('s', { payloadSchema: { type: 'nope' } })]) }),
+          importer: importerOf({ 'fake-a': withSources('fake-a', [fakeSource('s', { payloadSchema: { type: 'nope' } })]) }),
           logger: { warn: vi.fn(), error: vi.fn() },
         });
         expect(reg.status()).toEqual([

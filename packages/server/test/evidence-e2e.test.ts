@@ -28,6 +28,7 @@ describe('evidence retention end to end (startRemora + core plugin)', () => {
     try {
       app = await startRemora({ databaseUrl: url, importer });
       await app.close();
+      app = undefined; // so the finally block never closes it a second time
       const pool = new (await import('pg')).default.Pool({ connectionString: url });
       await pool.query(`UPDATE plugin SET config = jsonb_set(config, '{evidenceSources}', $1::jsonb)`, [
         JSON.stringify([tg]),

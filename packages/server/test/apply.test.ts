@@ -393,9 +393,9 @@ describe('apply', () => {
   it('NUL characters in values and keys are invalid_param, not raw DB errors', async () => {
     await withDb(async ({ run }) => {
       expect(
-        errOf(await run({ op: 'add_property', entity: 'bob', property: 'nickname', value: 'a b' })),
+        errOf(await run({ op: 'add_property', entity: 'bob', property: 'nickname', value: 'a\u0000b' })),
       ).toMatchObject({ op_index: 0, code: 'invalid_param' });
-      expect(errOf(await run({ op: 'create_entity', key: 'a b' }))).toMatchObject({
+      expect(errOf(await run({ op: 'create_entity', key: 'a\u0000b' }))).toMatchObject({
         op_index: 0,
         code: 'invalid_param',
       });

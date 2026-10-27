@@ -228,7 +228,7 @@ describe('query', () => {
 
   it('find_entities with a NUL in the query -> invalid_param', async () => {
     await withDb(async ({ q }) => {
-      expect(err(await q({ op: 'find_entities', query: 'a b' })).code).toBe('invalid_param');
+      expect(err(await q({ op: 'find_entities', query: 'a\u0000b' })).code).toBe('invalid_param');
     });
   });
 
