@@ -238,7 +238,7 @@ relation_id=10  Bob → Google  works_at  real      [1790812800,1792540800)
 
 ```json
 {"ops": [
-  {"op": "add_evidence", "as": "e1", "source": "chat_message", "payload": {"msg": "..."}},
+  {"op": "add_evidence", "as": "e1", "source": "chat_message", "payload": {"text": "..."}},
   {"op": "create_entity", "key": "carl"},
   {"op": "replace_property", "entity": "bob", "property": "job_title",
    "time": {"axis": "game_day", "at": 292}, "value": "Senior", "evidence": "$e1"},

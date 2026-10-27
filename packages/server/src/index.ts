@@ -36,5 +36,7 @@ export {
 export type { RetentionReport, PurgeArgs } from './services/evidence-maintenance.js';
 export { addEvent, updateEvent, retractEvent, normalizeKeywords } from './services/events.js';
 export type { EventEntityIn, EventUpdate } from './services/events.js';
+export { parseEventTimes, parseWhen } from './services/time.js';
+export type { EventSpan, EventTimeOut, TimeOut, When } from './services/time.js';
 export { getEvent, searchEvents, entityEvents, listEventRoles } from './services/events-read.js';
 export type { EventRow, SearchEventsArgs } from './services/events-read.js';
