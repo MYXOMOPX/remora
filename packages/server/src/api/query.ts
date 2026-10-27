@@ -12,6 +12,7 @@ import {
   type RelationType,
 } from '../services/dictionaries.js';
 import { findEntities, requireEntity } from '../services/entities.js';
+import { entityEvents, getEvent, listEventRoles, searchEvents, type EventRow } from '../services/events-read.js';
 import { getEvidence, listEvidenceSources } from '../services/evidence.js';
 import {
   propertyAt,
@@ -93,6 +94,22 @@ function neighborRow(r: NeighborRow): Obj {
     );
   }
   if (r.properties !== undefined) out.properties = r.properties;
+  return out;
+}
+
+function eventRow(r: EventRow): Obj {
+  const out: Obj = {
+    id: Number(r.id),
+    summary: r.summary,
+    details: r.details,
+    keywords: r.keywords,
+    time: r.time,
+    entities: r.entities.map((e) => ({ entity: e.entity, role: e.role })),
+    evidence_id: r.evidenceId === null ? null : Number(r.evidenceId),
+    recorded_at: r.recordedAt.toISOString(),
+    updated_at: r.updatedAt === null ? null : r.updatedAt.toISOString(),
+  };
+  if (r.retractedAt !== null) out.retracted_at = r.retractedAt.toISOString();
   return out;
 }
 
@@ -219,6 +236,45 @@ const HANDLERS: Record<string, Handler> = {
       pinned: e.pinned,
     };
   },
+  async get_event({ db, registry }, o) {
+    const id = int(o, 'id');
+    if (id < 1) throw invalid('id must be a positive integer', 'id');
+    return eventRow(await getEvent(db, registry, BigInt(id)));
+  },
+  async search_events({ db, registry }, o) {
+    const text = optStr(o, 'text');
+    const keywords = optStrArr(o, 'keywords');
+    const match = optStr(o, 'match');
+    if (match !== undefined && match !== 'any' && match !== 'all') {
+      throw invalid('match must be any or all', 'match');
+    }
+    const entities = optStrArr(o, 'entities');
+    const when = parseWhen(registry, o.when);
+    const limit = optInt(o, 'limit');
+    const r = await searchEvents(db, registry, {
+      ...(text !== undefined ? { text } : {}),
+      ...(keywords !== undefined ? { keywords } : {}),
+      ...(match !== undefined ? { match } : {}),
+      ...(entities !== undefined ? { entities } : {}),
+      ...(when !== undefined ? { when } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    });
+    return { rows: r.rows.map(eventRow), total: r.total, truncated: r.truncated };
+  },
+  async entity_events({ db, registry }, o) {
+    const entity = str(o, 'entity');
+    const when = parseWhen(registry, o.when);
+    const limit = optInt(o, 'limit');
+    const r = await entityEvents(db, registry, {
+      entity,
+      ...(when !== undefined ? { when } : {}),
+      ...(limit !== undefined ? { limit } : {}),
+    });
+    return { rows: r.rows.map(eventRow), total: r.total, truncated: r.truncated };
+  },
+  async list_event_roles({ db }) {
+    return { roles: await listEventRoles(db) };
+  },
   async list_time_axes({ db }) {
     const axes = await listTimeAxes(db);
     return {
@@ -252,7 +308,6 @@ export async function query(pool: pg.Pool, registry: PluginRegistry, request: un
       try {
         if (!isObj(op)) throw new RemoraError('invalid_param', 'op must be an object');
         const name = op.op;
-        // event and evidence ops arrive in plan 3: unknown here
         const handler = typeof name === 'string' && Object.hasOwn(HANDLERS, name) ? HANDLERS[name] : undefined;
         if (!handler) {
           throw new RemoraError('invalid_param', `unknown op: ${String(name)}`, { op: name });

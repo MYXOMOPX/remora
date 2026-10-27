@@ -206,13 +206,7 @@ describe('query', () => {
 
   it('unknown and deferred ops are invalid_param; failing second op reports op_index 1', async () => {
     await withDb(async ({ q }) => {
-      const names = [
-        'get_event',
-        'search_events',
-        'entity_events',
-        'list_event_roles',
-        'frobnicate',
-      ];
+      const names = ['frobnicate'];
       for (const op of names) {
         expect(err(await q({ op }))).toMatchObject({ op_index: 0, code: 'invalid_param' });
       }
