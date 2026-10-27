@@ -34,7 +34,7 @@ export const defaultConfig: CoreConfig = {
   evidenceSources: [
     {
       name: 'chat_message',
-      description: 'Сообщение из чата: text (обязательно), sender, sent_at.',
+      description: 'Chat message: text (required), sender, sent_at.',
       schema: {
         type: 'object',
         properties: { text: { type: 'string' }, sender: { type: 'string' }, sent_at: { type: 'string' } },
