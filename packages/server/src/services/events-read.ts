@@ -117,6 +117,7 @@ export async function searchEvents(
     throw invalid('match must be any or all', 'match');
   }
   if (a.text !== undefined) {
+    if (typeof a.text !== 'string' || a.text.trim() === '') throw invalid('text must not be empty', 'text');
     for (const pat of wordPatterns(a.text)) {
       conds.push(`(ev.summary || ' ' || coalesce(ev.details, '')) ILIKE ${p(pat)}`);
     }
@@ -129,7 +130,9 @@ export async function searchEvents(
     conds.push(`ev.keywords ${op} ${p(normalizeKeywords(a.keywords), '::text[]')}`);
   }
   if (a.entities !== undefined) {
-    if (!Array.isArray(a.entities)) throw invalid('entities must be an array', 'entities');
+    if (!Array.isArray(a.entities) || a.entities.length === 0) {
+      throw invalid('entities must be a non-empty array', 'entities');
+    }
     const seen = new Set<bigint>();
     for (const key of a.entities) {
       const e = await requireEntity(db, key);

@@ -244,10 +244,7 @@ const HANDLERS: Record<string, Handler> = {
   async search_events({ db, registry }, o) {
     const text = optStr(o, 'text');
     const keywords = optStrArr(o, 'keywords');
-    const match = optStr(o, 'match');
-    if (match !== undefined && match !== 'any' && match !== 'all') {
-      throw invalid('match must be any or all', 'match');
-    }
+    const match = optStr(o, 'match') as 'any' | 'all' | undefined; // validated by searchEvents
     const entities = optStrArr(o, 'entities');
     const when = parseWhen(registry, o.when);
     const limit = optInt(o, 'limit');
