@@ -10,6 +10,8 @@ import { runApply, runQuery } from '../transport/dispatch.js';
 export interface McpOptions {
   /** Called with errors thrown by the app; the client only ever sees a generic `internal` envelope. */
   onError?(error: unknown): void;
+  /** Called with each tool result envelope (for the access log). */
+  onResult?(envelope: { ok: boolean; error?: { code?: string } }): void;
 }
 
 const APPLY_DESCRIPTION =
@@ -28,11 +30,12 @@ function errorEnvelope(error: ApiError): { ok: false; error: ApiError } {
 }
 
 /** R27: the envelope is both `structuredContent` and the text content; `isError` mirrors `ok:false`. */
-function toolResult(envelope: { ok: boolean }): {
+function toolResult(envelope: { ok: boolean }, opts?: McpOptions): {
   content: { type: 'text'; text: string }[];
   structuredContent: Record<string, unknown>;
   isError: boolean;
 } {
+  opts?.onResult?.(envelope);
   return {
     content: [{ type: 'text', text: JSON.stringify(envelope) }],
     structuredContent: envelope as unknown as Record<string, unknown>,
@@ -57,13 +60,14 @@ export function createMcpServer(app: RemoraApp, opts: McpOptions = {}): Server {
     if (name !== 'apply' && name !== 'query') {
       return toolResult(
         errorEnvelope({ op_index: -1, code: 'invalid_param', message: `unknown tool "${name}"; use "apply" or "query"` }),
+        opts,
       );
     }
     try {
-      return toolResult(name === 'apply' ? await runApply(app, args) : await runQuery(app, args));
+      return toolResult(name === 'apply' ? await runApply(app, args) : await runQuery(app, args), opts);
     } catch (e) {
       opts.onError?.(e);
-      return toolResult(errorEnvelope({ op_index: -1, code: 'internal', message: 'internal error' }));
+      return toolResult(errorEnvelope({ op_index: -1, code: 'internal', message: 'internal error' }), opts);
     }
   });
 

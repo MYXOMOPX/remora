@@ -218,6 +218,32 @@ describe('MCP over Streamable HTTP', () => {
     expect(r.status).toBe(413);
   });
 
+  it('rejects JSON-RPC batch arrays with -32600', async () => {
+    const env = await setupHttp();
+    const batch = JSON.stringify([
+      { jsonrpc: '2.0', id: 1, method: 'tools/list' },
+      { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+    ]);
+    const r = await rawRequest(env.port, `/${SECRET}/mcp`, batch, {
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+    });
+    expect(r.status).toBe(400);
+    expect(JSON.parse(r.text)).toMatchObject({ jsonrpc: '2.0', id: null, error: { code: -32600 } });
+  });
+
+  it('1001 ops through tools/call give the cap error and the access log carries ops and code', async () => {
+    const env = await setupHttp();
+    const client = await httpClient(env.url());
+    const ops = Array.from({ length: 1001 }, (_, i) => ({ op: 'create_entity', key: `e${i}` }));
+    const r = await client.callTool({ name: 'apply', arguments: { ops } });
+    expect(r.isError).toBe(true);
+    expect((r.structuredContent as any).error.code).toBe('invalid_param');
+    expect(JSON.stringify(r.structuredContent)).toMatch(/1000/);
+    const line = env.lines.map((l) => JSON.parse(l)).find((l) => l.msg === 'request' && l.ops === 1001);
+    expect(line).toMatchObject({ route: '/:secret/mcp', ops: 1001, code: 'invalid_param' });
+  });
+
   it('logs the MCP route without the secret', async () => {
     const env = await setupHttp();
     const client = await httpClient(env.url());

@@ -179,7 +179,21 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
         async handle(ctx, o) {
           // same body limit, content-type check and slow-body timer as the JSON routes
           const body = await readJsonBody(ctx.req, o.maxBodyBytes, bodyTimeoutMs);
+          // batching was removed in protocol 2025-06-18; one array would run up to 100 calls concurrently
+          if (Array.isArray(body)) {
+            return send(ctx, 400, {
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: -32600, message: 'JSON-RPC batch requests are not supported' },
+            });
+          }
+          const params = (body as { params?: { arguments?: unknown } } | null)?.params;
+          const ops = countOps(params?.arguments);
+          if (ops !== undefined) ctx.ops = ops;
           await handleMcp(app, ctx.req, ctx.res, body, {
+            onResult: (env) => {
+              if (!env.ok && typeof env.error?.code === 'string') ctx.code = env.error.code;
+            },
             onError: (e) => logger.error('mcp error', { request_id: ctx.requestId, error: e instanceof Error ? e.name : typeof e }),
           });
         },
