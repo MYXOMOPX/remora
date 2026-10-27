@@ -8,6 +8,7 @@ import { getContract } from '../contract/index.js';
 import type { JsonLogger } from '../log.js';
 import { handleMcp } from '../mcp/server.js';
 import { runApply, runQuery } from '../transport/dispatch.js';
+import { ADMIN_GET_OPS, ADMIN_OPS, handleAdmin } from './admin.js';
 import { HttpError, readJsonBody } from './body.js';
 import { isValidSecret, secretMatches } from './secret.js';
 import { statusFor } from './status.js';
@@ -39,7 +40,7 @@ interface Ctx {
   close: boolean;
 }
 
-/** A route below `/<secret>/`. Task 8 adds `admin` to the table. */
+/** A route below `/<secret>/`. Admin routes (`/<admin_secret>/admin/<op>`) are handled apart. */
 interface Route {
   method: string;
   label: string;
@@ -221,6 +222,26 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
 
   const methodNotAllowed = (): ApiError => ({ op_index: -1, code: 'invalid_param', message: 'method not allowed' });
 
+  /** R30/R40: the admin secret and its own routes; an unknown op is the same 404 as an unknown path. */
+  async function adminRoute(ctx: Ctx, op: string): Promise<void> {
+    if (!ADMIN_OPS.has(op)) return notFound(ctx);
+    ctx.route = `/:admin_secret/admin/${op}`;
+    const method = ctx.req.method;
+    const allowGet = ADMIN_GET_OPS.has(op);
+    if (method !== 'POST' && !(allowGet && method === 'GET')) {
+      return sendError(ctx, 405, methodNotAllowed(), { allow: allowGet ? 'GET, POST' : 'POST' });
+    }
+    let body: unknown = {};
+    if (method === 'POST') {
+      ctx.close = false; // the body is read (or fails and sets close itself)
+      body = await readJsonBody(ctx.req, opts.maxBodyBytes, bodyTimeoutMs);
+    }
+    // op name only: never the secret, the body or config values
+    logger.info('admin op', { request_id: ctx.requestId, op });
+    const r = await handleAdmin(app, op, body);
+    send(ctx, r.status, r.body);
+  }
+
   async function route(ctx: Ctx): Promise<void> {
     const { req } = ctx;
     // a request that carries a body we are not going to read must not keep the connection
@@ -248,6 +269,8 @@ export function createHttpServer(app: RemoraApp, opts: HttpOptions, logger: Json
     const segs = path.slice(1).split('/');
     // always compare, whatever the shape of the path
     const matched = secretMatches(segs[0] ?? '', opts.secret);
+    const adminMatched = opts.adminSecret !== undefined && secretMatches(segs[0] ?? '', opts.adminSecret);
+    if (adminMatched && segs.length === 3 && segs[1] === 'admin') return adminRoute(ctx, segs[2]!);
     const r = matched && segs.length === 2 ? routes.get(segs[1]!) : undefined;
     if (!r) return notFound(ctx);
 

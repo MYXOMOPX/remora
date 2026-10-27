@@ -41,7 +41,7 @@ const addFormats = addFormatsModule.default;
 const ajv = new Ajv();
 addFormats(ajv);
 
-function checkConfig(def: PluginDef, config: unknown, what: string): void {
+export function checkConfig(def: PluginDef, config: unknown, what: string): void {
   let ok: boolean;
   let detail: string;
   try {
@@ -58,7 +58,7 @@ function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
-function asPluginDef(raw: unknown, spec: string): PluginDef {
+export function asPluginDef(raw: unknown, spec: string): PluginDef {
   const d = raw as Partial<PluginDef> | null | undefined;
   if (
     d === null ||
@@ -78,7 +78,7 @@ function isObject(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
 
-function validateSetupResult(raw: unknown, plugin: string): ReturnType<PluginDef['setup']> {
+export function validateSetupResult(raw: unknown, plugin: string): ReturnType<PluginDef['setup']> {
   const bad = (reason: string) =>
     new RemoraError('invalid_plugin', `plugin ${plugin}: setup() result is malformed: ${reason}`);
   if (raw === null || raw === undefined) return {};
@@ -274,7 +274,7 @@ export async function loadPlugins(
   };
 }
 
-function assertUniqueNames(setup: ReturnType<PluginDef['setup']>, plugin: string): void {
+export function assertUniqueNames(setup: ReturnType<PluginDef['setup']>, plugin: string): void {
   for (const [what, list] of [
     ['time axis', setup.timeAxes ?? []],
     ['evidence source', setup.evidenceSources ?? []],
@@ -289,7 +289,7 @@ function assertUniqueNames(setup: ReturnType<PluginDef['setup']>, plugin: string
   }
 }
 
-async function assertNameFree(
+export async function assertNameFree(
   db: Queryable,
   table: 'time_axis' | 'evidence_source',
   name: string,

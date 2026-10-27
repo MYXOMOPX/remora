@@ -12,6 +12,12 @@ import {
   type RetentionReport,
 } from './services/evidence-maintenance.js';
 import {
+  listPlugins,
+  removePlugin,
+  setPluginConfig,
+  type PluginListRow,
+} from './services/plugins-admin.js';
+import {
   addPlugin,
   CORE_PLUGIN_NAME,
   loadPlugins,
@@ -37,6 +43,9 @@ export interface RemoraApp {
   registry: PluginRegistry;
   importer: Importer;
   addPlugin(a: { package: string }): Promise<{ id: number; name: string }>;
+  listPlugins(): Promise<PluginListRow[]>;
+  setPluginConfig(a: { name: string; config: unknown; confirm?: boolean }): Promise<{ name: string; restartRequired: true }>;
+  removePlugin(name: string): Promise<{ name: string; restartRequired: true }>;
   apply(request: unknown): Promise<ApplyResponse>;
   query(request: unknown): Promise<QueryResponse>;
   applyRetention(a?: { source?: string; batchSize?: number; now?: Date }): Promise<RetentionReport>;
@@ -60,6 +69,9 @@ export async function startRemora(opts: StartOptions): Promise<RemoraApp> {
       registry,
       importer,
       addPlugin: (a) => addPlugin(pool, a, importer),
+      listPlugins: () => listPlugins(pool, registry),
+      setPluginConfig: (a) => setPluginConfig(pool, importer, a),
+      removePlugin: (name) => removePlugin(pool, name),
       apply: (request) => apply(pool, registry, request),
       query: (request) => query(pool, registry, request),
       applyRetention: (a) => applyRetention(pool, registry, a),
