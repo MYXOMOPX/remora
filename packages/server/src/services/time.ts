@@ -65,6 +65,11 @@ export function encodeValue(axis: AxisRef, value: unknown): bigint {
   return n;
 }
 
+function rejectUnknownKeys(raw: Record<string, unknown>, allowed: string[], what: string): void {
+  const extra = Object.keys(raw).find((k) => !allowed.includes(k));
+  if (extra !== undefined) throw invalidParam(`${what} has an unknown key ${extra}`, { field: extra });
+}
+
 function readAxis(registry: PluginRegistry, obj: Record<string, unknown>): AxisRef {
   if (typeof obj.axis !== 'string' || obj.axis === '') throw invalidParam('time.axis must be a non-empty string');
   return registry.getAxis(obj.axis);
@@ -73,6 +78,7 @@ function readAxis(registry: PluginRegistry, obj: Record<string, unknown>): AxisR
 function parseSpan(registry: PluginRegistry, raw: unknown): Span {
   if (!isPlainObject(raw)) throw invalidParam('time must be an object {axis, from?, to?}');
   if ('at' in raw || 'during' in raw) throw invalidParam('time on add must not contain at/during; use from/to');
+  rejectUnknownKeys(raw, ['axis', 'from', 'to'], 'time');
   const axis = readAxis(registry, raw);
   const lo = raw.from === undefined ? null : encodeValue(axis, raw.from);
   const hi = raw.to === undefined ? null : encodeValue(axis, raw.to);
@@ -103,6 +109,7 @@ export function parseSpans(registry: PluginRegistry, raw: unknown): Span[] {
 export function parseMoment(registry: PluginRegistry, raw: unknown): Moment {
   if (!isPlainObject(raw)) throw invalidParam('time must be an object {axis, at}');
   if ('from' in raw || 'to' in raw || 'during' in raw) throw invalidParam('time must contain only axis and at');
+  rejectUnknownKeys(raw, ['axis', 'at'], 'time');
   const axis = readAxis(registry, raw);
   if (raw.at === undefined) throw invalidParam('time.at is required');
   return { axis, at: encodeValue(axis, raw.at) };
@@ -112,6 +119,7 @@ export function parseWhen(registry: PluginRegistry, raw: unknown): When | undefi
   if (raw === undefined) return undefined;
   if (!isPlainObject(raw)) throw invalidParam('when must be an object {axis, at} or {axis, during}');
   if ('from' in raw || 'to' in raw) throw invalidParam('when must not contain from/to');
+  rejectUnknownKeys(raw, ['axis', 'at', 'during'], 'when');
   const hasAt = raw.at !== undefined;
   const hasDuring = raw.during !== undefined;
   if (hasAt === hasDuring) throw invalidParam('when needs exactly one of at, during');
@@ -157,6 +165,7 @@ export interface EventTimeOut {
 function parseEventSpan(registry: PluginRegistry, raw: unknown): EventSpan {
   if (!isPlainObject(raw)) throw invalidParam('time must be an object {axis, at} or {axis, from?, to?}');
   if ('during' in raw) throw invalidParam('time must not contain during; use at or from/to');
+  rejectUnknownKeys(raw, ['axis', 'at', 'from', 'to'], 'time');
   const axis = readAxis(registry, raw);
   if (raw.at !== undefined) {
     if ('from' in raw || 'to' in raw) throw invalidParam('time.at must not be combined with from/to');

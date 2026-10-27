@@ -124,9 +124,30 @@ export async function addEvent(
   return { id };
 }
 
-/** R24 */
+/**
+ * R24. Issues several statements (row lock, update, times, links): it MUST run inside a
+ * transaction, otherwise a failure half way leaves a partially updated event.
+ */
 export async function updateEvent(db: Queryable, u: EventUpdate): Promise<{ id: bigint }> {
-  const changes = [u.summary, u.details, u.keywords, u.times, u.entities, u.evidenceId];
+  // empty containers (entities: {}, {add: []}, keywords: {add: []}, times: []) change nothing
+  const kwIn = u.keywords as { set?: unknown; add?: unknown; remove?: unknown } | undefined;
+  const nonEmpty = (x: unknown): boolean => !Array.isArray(x) || x.length > 0; // non-arrays are reported below
+  const keywordsChange =
+    kwIn !== undefined &&
+    (kwIn.set !== undefined ||
+      (kwIn.add === undefined && kwIn.remove === undefined) || // malformed shape: reported below
+      (kwIn.add !== undefined && nonEmpty(kwIn.add)) ||
+      (kwIn.remove !== undefined && nonEmpty(kwIn.remove)));
+  const entitiesChange = u.entities !== undefined && (u.entities.add?.length ?? 0) + (u.entities.remove?.length ?? 0) > 0;
+  const timesChange = u.times !== undefined && u.times.length > 0;
+  const changes = [
+    u.summary,
+    u.details,
+    keywordsChange || undefined,
+    timesChange || undefined,
+    entitiesChange || undefined,
+    u.evidenceId,
+  ];
   if (changes.every((x) => x === undefined)) throw invalid('update_event needs at least one field to change');
   const summary = u.summary === undefined ? undefined : cleanSummary(u.summary);
   checkDetails(u.details);
@@ -179,8 +200,13 @@ export async function updateEvent(db: Queryable, u: EventUpdate): Promise<{ id: 
   if (u.times) await upsertTimes(db, u.id, u.times);
   if (u.entities) {
     // remove first, then add: a pair listed in both ends up attached
+    const removed = new Set<string>();
     for (const rm of u.entities.remove ?? []) {
       const entity = await requireEntity(db, rm.entity);
+      // listing the same pair twice is the same removal, not a second (failing) one
+      const key = `${entity.entityId}:${rm.role === undefined ? '*' : normalizeName(rm.role)}`;
+      if (removed.has(key)) continue;
+      removed.add(key);
       const del =
         rm.role === undefined
           ? await db.query('DELETE FROM event_entity WHERE event_id = $1 AND entity_id = $2', [

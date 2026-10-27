@@ -132,6 +132,15 @@ describe('parseEventTimes', () => {
     ));
 });
 
+describe('unknown keys in time objects', () => {
+  it('are rejected consistently by every parser', () => {
+    expect(codeOf(() => parseSpans(reg, { axis: 'game_day', from: 1, typo: 1 }))).toBe('invalid_param');
+    expect(codeOf(() => parseMoment(reg, { axis: 'game_day', at: 1, typo: 1 }))).toBe('invalid_param');
+    expect(codeOf(() => parseWhen(reg, { axis: 'game_day', at: 1, typo: 1 }))).toBe('invalid_param');
+    expect(codeOf(() => parseEventTimes(reg, { axis: 'game_day', at: 1, typo: 1 }))).toBe('invalid_param');
+  });
+});
+
 describe('formatEventTime', () => {
   it('instant', () => expect(formatEventTime(reg, 1, '300', '301', true)).toEqual({ axis: 'game_day', at: 300 }));
   it('open span', () => {

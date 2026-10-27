@@ -223,9 +223,6 @@ const HANDLERS: Record<string, Handler> = {
   async update_event(env, o) {
     const id = BigInt(int(o, 'id'));
     const summary = optStr(o, 'summary');
-    if (o.details !== undefined && o.details !== null && typeof o.details !== 'string') {
-      throw new RemoraError('invalid_param', 'details must be a string or null', { field: 'details' });
-    }
     const keywords = keywordsArg(o.keywords);
     const times = o.time === undefined ? undefined : parseEventTimes(env.registry, o.time);
     const ent = optObj(o, 'entities');

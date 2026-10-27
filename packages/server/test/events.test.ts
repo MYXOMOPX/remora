@@ -14,6 +14,7 @@ import { createTestDb } from './helpers/testDb.js';
 interface Ctx {
   pool: pg.Pool;
   reg: PluginRegistry;
+  axes: { gameDay: number; real: number };
 }
 
 async function withDb(fn: (c: Ctx) => Promise<void>): Promise<void> {
@@ -22,7 +23,7 @@ async function withDb(fn: (c: Ctx) => Promise<void>): Promise<void> {
     await runMigrations(pool);
     const seeded = await seedBasics(pool);
     const reg = await seedAxes(pool, seeded, [fakeSource('chat')]);
-    await fn({ pool, reg });
+    await fn({ pool, reg, axes: seeded.axes });
   } finally {
     await drop();
   }
@@ -65,7 +66,7 @@ describe('normalizeKeywords', () => {
 
 describe('addEvent', () => {
   it('stores event, times, entities, keywords', async () => {
-    await withDb(async ({ pool, reg }) => {
+    await withDb(async ({ pool, reg, axes }) => {
       await createEntity(pool, 'carl');
       const times = parseEventTimes(reg, [gd(300), { axis: 'real', from: 5 }]);
       const { id } = await addEvent(pool, {
@@ -86,8 +87,8 @@ describe('addEvent', () => {
         [id],
       );
       expect(t.rows).toEqual([
-        { time_axis: 1, lo: '300', hi: '301', instant: true },
-        { time_axis: 2, lo: '5', hi: null, instant: false },
+        { time_axis: axes.gameDay, lo: '300', hi: '301', instant: true },
+        { time_axis: axes.real, lo: '5', hi: null, instant: false },
       ]);
       expect(await links(pool, id)).toEqual(['bob:eye_witness', 'carl:participant']);
     });
@@ -142,7 +143,7 @@ describe('updateEvent', () => {
     });
   });
   it('times replace one axis, add another, keep the rest', async () => {
-    await withDb(async ({ pool, reg }) => {
+    await withDb(async ({ pool, reg, axes }) => {
       const id = await seed(pool, reg);
       await updateEvent(pool, { id, times: parseEventTimes(reg, gd(400)) });
       await updateEvent(pool, { id, times: parseEventTimes(reg, { axis: 'real', from: 1, to: 9 }) });
@@ -151,8 +152,8 @@ describe('updateEvent', () => {
         [id],
       );
       expect(t.rows).toEqual([
-        { time_axis: 1, lo: '400', hi: '401', instant: true },
-        { time_axis: 2, lo: '1', hi: '9', instant: false },
+        { time_axis: axes.gameDay, lo: '400', hi: '401', instant: true },
+        { time_axis: axes.real, lo: '1', hi: '9', instant: false },
       ]);
     });
   });
@@ -166,6 +167,48 @@ describe('updateEvent', () => {
       await updateEvent(pool, { id, entities: { remove: [{ entity: 'bob' }] } });
       expect(await links(pool, id)).toEqual(['carl:participant']);
       expect(await codeOf(updateEvent(pool, { id, entities: { remove: [{ entity: 'bob' }] } }))).toBe('not_found');
+    });
+  });
+  it('empty entities / keywords / times updates do not count as a field', async () => {
+    await withDb(async ({ pool, reg }) => {
+      const id = await seed(pool, reg);
+      const empties = [
+        { entities: {} },
+        { entities: { add: [] } },
+        { entities: { remove: [] } },
+        { entities: { add: [], remove: [] } },
+        { keywords: { add: [] } },
+        { keywords: { remove: [] } },
+        { keywords: { add: [], remove: [] } },
+        { times: [] },
+      ];
+      for (const u of empties) {
+        expect(await codeOf(updateEvent(pool, { id, ...u } as never)), JSON.stringify(u)).toBe('invalid_param');
+      }
+      // next to a real change they are harmless
+      await updateEvent(pool, { id, summary: 'ok', entities: { add: [] }, keywords: { add: [] } });
+      expect((await row(pool, id)).summary).toBe('ok');
+      // set: [] is a real change (clears keywords)
+      await updateEvent(pool, { id, keywords: { set: [] } });
+      expect((await row(pool, id)).keywords).toEqual([]);
+    });
+  });
+  it('time items reject unknown keys', async () => {
+    await withDb(async ({ reg }) => {
+      for (const t of [{ axis: 'game_day', at: 1, foo: 1 }, { axis: 'game_day', from: 1, typo: 2 }]) {
+        expect(() => parseEventTimes(reg, t)).toThrow(expect.objectContaining({ code: 'invalid_param' }));
+      }
+    });
+  });
+  it('duplicate remove entries are idempotent; unknown entity in remove -> unknown_entity', async () => {
+    await withDb(async ({ pool, reg }) => {
+      const id = await seed(pool, reg);
+      const rm = { entity: 'bob', role: 'witness' };
+      await updateEvent(pool, { id, entities: { remove: [rm, rm, { entity: 'bob', role: ' Witness ' }] } });
+      expect(await links(pool, id)).toEqual(['bob:actor']);
+      expect(await codeOf(updateEvent(pool, { id, entities: { remove: [{ entity: 'nobody' }] } }))).toBe(
+        'unknown_entity',
+      );
     });
   });
   it('only id -> invalid_param; missing / retracted -> not_found', async () => {
@@ -251,6 +294,7 @@ describe('apply events', () => {
         'unknown_ref',
       );
       expect(await code({ op: 'update_event', id: 'a', summary: 'x' })).toBe('invalid_param');
+      expect(await code({ op: 'update_event', id: 5, details: 7 })).toBe('invalid_param');
       expect(await code({ op: 'update_event', id: 5, summary: 'x' })).toBe('not_found');
       expect(await code({ op: 'retract_event', id: 5 })).toBe('not_found');
     });
