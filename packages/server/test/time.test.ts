@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { RemoraError } from '@remora/sdk';
-import { encodeValue, formatTime, parseMoment, parseSpans, parseWhen } from '../src/services/time.js';
+import { encodeValue, formatEventTime, formatTime, parseEventTimes, parseMoment, parseSpans, parseWhen } from '../src/services/time.js';
 import { bigAxis, fakeRegistry, intAxis } from './helpers/axes.js';
 
 const reg = fakeRegistry([
@@ -96,4 +96,47 @@ describe('encodeValue / formatTime', () => {
     expect('to' in out).toBe(false);
   });
   it('null axis', () => expect(formatTime(reg, null, null, null)).toBeNull());
+});
+
+describe('parseEventTimes', () => {
+  it('instant at', () => {
+    const s = parseEventTimes(reg, { axis: 'game_day', at: 300 });
+    expect(s).toHaveLength(1);
+    expect([s[0]!.lo, s[0]!.hi, s[0]!.instant]).toEqual([300n, 301n, true]);
+  });
+  it('span from/to', () => {
+    const s = parseEventTimes(reg, { axis: 'game_day', from: 299, to: 301 });
+    expect([s[0]!.lo, s[0]!.hi, s[0]!.instant]).toEqual([299n, 301n, false]);
+  });
+  it('open span', () => {
+    const s = parseEventTimes(reg, { axis: 'game_day' });
+    expect([s[0]!.lo, s[0]!.hi, s[0]!.instant]).toEqual([null, null, false]);
+  });
+  it('two axes in an array', () => {
+    const s = parseEventTimes(reg, [{ axis: 'game_day', at: 1 }, { axis: 'big', from: { v: '2' } }]);
+    expect(s.map((x) => x.axis.name)).toEqual(['game_day', 'big']);
+  });
+  it('[] / undefined / duplicate axis / at with from -> invalid_param', () => {
+    expect(codeOf(() => parseEventTimes(reg, []))).toBe('invalid_param');
+    expect(codeOf(() => parseEventTimes(reg, undefined))).toBe('invalid_param');
+    expect(codeOf(() => parseEventTimes(reg, [{ axis: 'game_day' }, { axis: 'game_day', at: 1 }]))).toBe(
+      'invalid_param',
+    );
+    expect(codeOf(() => parseEventTimes(reg, { axis: 'game_day', at: 1, from: 0 }))).toBe('invalid_param');
+  });
+  it('from == to -> invalid_time', () =>
+    expect(codeOf(() => parseEventTimes(reg, { axis: 'game_day', from: 5, to: 5 }))).toBe('invalid_time'));
+  it('at without room for at+1 -> invalid_time', () =>
+    expect(codeOf(() => parseEventTimes(reg, { axis: 'big', at: { v: '9223372036854775807' } }))).toBe(
+      'invalid_time',
+    ));
+});
+
+describe('formatEventTime', () => {
+  it('instant', () => expect(formatEventTime(reg, 1, '300', '301', true)).toEqual({ axis: 'game_day', at: 300 }));
+  it('open span', () => {
+    const out = formatEventTime(reg, 1, '299', null, false);
+    expect(out).toEqual({ axis: 'game_day', from: 299 });
+    expect('to' in out).toBe(false);
+  });
 });

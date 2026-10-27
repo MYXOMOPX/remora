@@ -4,11 +4,12 @@ import type { Queryable } from '../db/types.js';
 import type { PluginRegistry } from '../plugins/registry.js';
 import { createPropertyType, createRelationType, type ValueType } from '../services/dictionaries.js';
 import { createEntity } from '../services/entities.js';
+import { addEvent, retractEvent, updateEvent, type EventEntityIn } from '../services/events.js';
 import { addEvidence } from '../services/evidence.js';
 import { addProperty, endProperty, replaceProperty, retractProperty } from '../services/properties.js';
 import { addRelation, endRelation, retractRelation, type RelationRef } from '../services/relations.js';
-import { parseMoment, parseSpans } from '../services/time.js';
-import { bool, int, isObj, optStr, str, type Obj } from './args.js';
+import { parseEventTimes, parseMoment, parseSpans } from '../services/time.js';
+import { bool, int, isObj, optStr, optStrArr, str, type Obj } from './args.js';
 
 export type ApiError = {
   op_index: number;
@@ -52,8 +53,6 @@ interface Binding {
 
 /** Ops whose result carries an evidence `id`. */
 const EVIDENCE_OPS: ReadonlySet<string> = new Set(['add_evidence']);
-
-const DEFERRED = new Set(['add_event', 'update_event', 'retract_event']);
 
 function unknownRef(ref: string): RemoraError {
   return new RemoraError('unknown_ref', `unknown reference ${ref}`, { ref });
@@ -122,6 +121,51 @@ function relationRef(env: Env, o: Obj): RelationRef {
 
 const ev = (id: bigint | undefined): { evidenceId?: bigint } => (id === undefined ? {} : { evidenceId: id });
 
+function optObj(o: Obj, key: string): Obj | undefined {
+  const v = o[key];
+  if (v === undefined) return undefined;
+  if (!isObj(v)) throw new RemoraError('invalid_param', `${key} must be an object`, { field: key });
+  return v;
+}
+
+/** Event entity links: `entity` may be a key or a $name reference (R4); `role` optional. */
+function eventEntities(env: Env, raw: unknown, field: string): EventEntityIn[] | undefined {
+  if (raw === undefined) return undefined;
+  if (!Array.isArray(raw)) {
+    throw new RemoraError('invalid_param', `${field} must be an array`, { field });
+  }
+  return raw.map((x) => {
+    if (!isObj(x)) throw new RemoraError('invalid_param', `${field} items must be objects`, { field });
+    const role = optStr(x, 'role');
+    return { entity: entityArg(env, x, 'entity'), ...(role === undefined ? {} : { role }) };
+  });
+}
+
+/** keywords on update: {set} or {add?, remove?}. */
+function keywordsArg(raw: unknown): EventUpdateKeywords | undefined {
+  if (raw === undefined) return undefined;
+  if (!isObj(raw)) throw new RemoraError('invalid_param', 'keywords must be an object', { field: 'keywords' });
+  for (const k of Object.keys(raw)) {
+    if (k !== 'set' && k !== 'add' && k !== 'remove') {
+      throw new RemoraError('invalid_param', `unknown keywords field ${k}`, { field: 'keywords' });
+    }
+  }
+  const set = optStrArr(raw, 'set');
+  const add = optStrArr(raw, 'add');
+  const remove = optStrArr(raw, 'remove');
+  if (set !== undefined) {
+    if (add !== undefined || remove !== undefined) {
+      throw new RemoraError('invalid_param', 'keywords: set cannot be combined with add/remove', {
+        field: 'keywords',
+      });
+    }
+    return { set };
+  }
+  return { ...(add ? { add } : {}), ...(remove ? { remove } : {}) };
+}
+
+type EventUpdateKeywords = NonNullable<Parameters<typeof updateEvent>[1]['keywords']>;
+
 type Handler = (env: Env, o: Obj) => Promise<unknown>;
 
 const HANDLERS: Record<string, Handler> = {
@@ -159,6 +203,58 @@ const HANDLERS: Record<string, Handler> = {
   async add_evidence(env, o) {
     const source = str(o, 'source');
     return addEvidence(env.db, env.registry, { source, payload: o.payload });
+  },
+  async add_event(env, o) {
+    const summary = str(o, 'summary');
+    const details = optStr(o, 'details');
+    const keywords = optStrArr(o, 'keywords');
+    const times = parseEventTimes(env.registry, o.time);
+    const entities = eventEntities(env, o.entities, 'entities');
+    const evidenceId = await evidenceArg(env, o);
+    return addEvent(env.db, {
+      summary,
+      ...(details === undefined ? {} : { details }),
+      ...(keywords ? { keywords } : {}),
+      times,
+      ...(entities ? { entities } : {}),
+      ...ev(evidenceId),
+    });
+  },
+  async update_event(env, o) {
+    const id = BigInt(int(o, 'id'));
+    const summary = optStr(o, 'summary');
+    if (o.details !== undefined && o.details !== null && typeof o.details !== 'string') {
+      throw new RemoraError('invalid_param', 'details must be a string or null', { field: 'details' });
+    }
+    const keywords = keywordsArg(o.keywords);
+    const times = o.time === undefined ? undefined : parseEventTimes(env.registry, o.time);
+    const ent = optObj(o, 'entities');
+    let entities: { add?: EventEntityIn[]; remove?: EventEntityIn[] } | undefined;
+    if (ent) {
+      for (const k of Object.keys(ent)) {
+        if (k !== 'add' && k !== 'remove') {
+          throw new RemoraError('invalid_param', `unknown entities field ${k}`, { field: 'entities' });
+        }
+      }
+      const add = eventEntities(env, ent.add, 'entities.add');
+      const remove = eventEntities(env, ent.remove, 'entities.remove');
+      entities = { ...(add ? { add } : {}), ...(remove ? { remove } : {}) };
+    }
+    const evidenceId = await evidenceArg(env, o);
+    return updateEvent(env.db, {
+      id,
+      ...(summary === undefined ? {} : { summary }),
+      ...(o.details === undefined ? {} : { details: o.details as string | null }),
+      ...(keywords ? { keywords } : {}),
+      ...(times ? { times } : {}),
+      ...(entities ? { entities } : {}),
+      ...ev(evidenceId),
+    });
+  },
+  async retract_event(env, o) {
+    const id = BigInt(int(o, 'id'));
+    const evidenceId = await evidenceArg(env, o);
+    return retractEvent(env.db, { id, ...ev(evidenceId) });
   },
   async add_property(env, o) {
     const entity = entityArg(env, o, 'entity');
@@ -290,9 +386,7 @@ export async function apply(pool: pg.Pool, registry: PluginRegistry, request: un
         if (!isObj(op)) throw new RemoraError('invalid_param', 'op must be an object');
         const name = op.op;
         const handler =
-          typeof name === 'string' && !DEFERRED.has(name) && Object.hasOwn(HANDLERS, name)
-            ? HANDLERS[name]
-            : undefined;
+          typeof name === 'string' && Object.hasOwn(HANDLERS, name) ? HANDLERS[name] : undefined;
         if (!handler) {
           throw new RemoraError('invalid_param', `unknown op: ${String(name)}`, { op: name });
         }

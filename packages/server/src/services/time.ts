@@ -139,3 +139,74 @@ export function formatTime(
   if (hi !== null) out.to = axis.def.decode(BigInt(hi));
   return out;
 }
+
+export interface EventSpan {
+  axis: AxisRef;
+  lo: bigint | null;
+  hi: bigint | null;
+  instant: boolean;
+}
+
+export interface EventTimeOut {
+  axis: string;
+  at?: unknown;
+  from?: unknown;
+  to?: unknown;
+}
+
+function parseEventSpan(registry: PluginRegistry, raw: unknown): EventSpan {
+  if (!isPlainObject(raw)) throw invalidParam('time must be an object {axis, at} or {axis, from?, to?}');
+  if ('during' in raw) throw invalidParam('time must not contain during; use at or from/to');
+  const axis = readAxis(registry, raw);
+  if (raw.at !== undefined) {
+    if ('from' in raw || 'to' in raw) throw invalidParam('time.at must not be combined with from/to');
+    const at = encodeValue(axis, raw.at);
+    if (at >= INT8_MAX) {
+      throw new RemoraError('invalid_time', 'time.at is too large for an instant', { axis: axis.name });
+    }
+    return { axis, lo: at, hi: at + 1n, instant: true };
+  }
+  const lo = raw.from === undefined ? null : encodeValue(axis, raw.from);
+  const hi = raw.to === undefined ? null : encodeValue(axis, raw.to);
+  if (lo !== null && hi !== null && lo >= hi) {
+    throw new RemoraError('invalid_time', 'time.from must be less than time.to', { axis: axis.name });
+  }
+  return { axis, lo, hi, instant: false };
+}
+
+/** R22: required object or non-empty array of {axis, at} / {axis, from?, to?}. */
+export function parseEventTimes(registry: PluginRegistry, raw: unknown): EventSpan[] {
+  if (raw === undefined) throw invalidParam('time is required');
+  let items: unknown[];
+  if (Array.isArray(raw)) {
+    if (raw.length === 0) throw invalidParam('time must not be an empty array');
+    items = raw;
+  } else {
+    items = [raw];
+  }
+  const spans = items.map((x) => parseEventSpan(registry, x));
+  const seen = new Set<number>();
+  for (const s of spans) {
+    if (seen.has(s.axis.id)) throw invalidParam(`duplicate axis ${s.axis.name} in time`, { axis: s.axis.name });
+    seen.add(s.axis.id);
+  }
+  return spans;
+}
+
+export function formatEventTime(
+  registry: PluginRegistry,
+  axisId: number,
+  lo: string | null,
+  hi: string | null,
+  instant: boolean,
+): EventTimeOut {
+  const axis = registry.getAxisById(axisId);
+  const out: EventTimeOut = { axis: axis.name };
+  if (instant) {
+    if (lo !== null) out.at = axis.def.decode(BigInt(lo));
+    return out;
+  }
+  if (lo !== null) out.from = axis.def.decode(BigInt(lo));
+  if (hi !== null) out.to = axis.def.decode(BigInt(hi));
+  return out;
+}
