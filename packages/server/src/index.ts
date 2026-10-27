@@ -40,3 +40,5 @@ export { parseEventTimes, parseWhen } from './services/time.js';
 export type { EventSpan, EventTimeOut, TimeOut, When } from './services/time.js';
 export { getEvent, searchEvents, entityEvents, listEventRoles } from './services/events-read.js';
 export type { EventRow, SearchEventsArgs } from './services/events-read.js';
+export { getContract, validateApplyRequest, validateQueryRequest, MAX_OPS } from './contract/index.js';
+export type { Contract } from './contract/index.js';
