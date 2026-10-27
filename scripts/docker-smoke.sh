@@ -8,7 +8,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 PROJECT=remora-smoke
 PORT="${SMOKE_PORT:-18080}"
-BASE="http://localhost:$PORT"
+BASE="http://127.0.0.1:$PORT"
 ENV_FILE="$(mktemp)"
 export COMPOSE_PROJECT_NAME="$PROJECT"
 dc() { docker compose --env-file "$ENV_FILE" "$@"; }
@@ -16,7 +16,8 @@ gen() { node -e "console.log(require('crypto').randomBytes(32).toString('base64u
 
 SECRET="$(gen)"
 ADMIN="$(gen)"
-printf 'REMORA_SECRET=%s\nREMORA_ADMIN_SECRET=%s\nREMORA_PORT=%s\n' "$SECRET" "$ADMIN" "$PORT" > "$ENV_FILE"
+DBPASS="$(gen)"
+printf 'REMORA_SECRET=%s\nREMORA_ADMIN_SECRET=%s\nPOSTGRES_PASSWORD=%s\nREMORA_PORT=%s\n' "$SECRET" "$ADMIN" "$DBPASS" "$PORT" > "$ENV_FILE"
 
 cleanup() {
   code=$?
@@ -34,9 +35,25 @@ expect() { # expect <label> <haystack> <needle>
 }
 post() { curl -s -X POST -H 'content-type: application/json' -d "$2" "$BASE/$1"; }
 
+echo "== compose refuses to start without POSTGRES_PASSWORD"
+NOPASS="$(mktemp)"
+printf 'REMORA_SECRET=%s\n' "$SECRET" > "$NOPASS"
+if OUT="$(docker compose --env-file "$NOPASS" config 2>&1)"; then fail "compose accepted a missing POSTGRES_PASSWORD"; fi
+rm -f "$NOPASS"
+expect needs-password "$OUT" "set POSTGRES_PASSWORD in .env"
+
 echo "== build + up"
 dc up -d --build --wait
 expect health "$(curl -s "$BASE/health")" '"status":"ok"'
+
+echo "== port is published on loopback only"
+expect loopback-only "$(docker port "$(dc ps -q remora)" 8080/tcp)" "127.0.0.1:$PORT"
+expect host-in-container "$(dc exec -T remora printenv HOST | tr -d '\r')" "0.0.0.0"
+
+echo "== image contains no tests, sources or tsconfigs"
+LEFT="$(docker run --rm --entrypoint sh "${PROJECT}-remora" -c 'find /app -path /app/node_modules -prune -o \( -name "*.test.*" -o \( -name "*.ts" ! -name "*.d.ts" \) -o -name "tsconfig*" -o -name test -o -name fixtures \) -print' | tr -d '\r')"
+[ -z "$LEFT" ] || fail "unexpected files in the image: $LEFT"
+echo "ok   image has dist + migrations only"
 
 echo "== non-root"
 UID_IN="$(dc exec -T remora id -u | tr -d '\r')"

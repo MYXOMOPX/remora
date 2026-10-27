@@ -3,7 +3,7 @@ services:
     image: postgres:18
     environment:
       POSTGRES_USER: remora
-      POSTGRES_PASSWORD: remora
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: remora
     volumes:
       - pgdata:/var/lib/postgresql
@@ -17,12 +17,13 @@ services:
   remora:
     build: .
     environment:
-      DATABASE_URL: postgres://remora:remora@db:5432/remora
+      DATABASE_URL: postgres://remora:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/remora
       REMORA_SECRET: ${REMORA_SECRET:?set REMORA_SECRET in .env}
       REMORA_ADMIN_SECRET: ${REMORA_ADMIN_SECRET:-}
       LOG_LEVEL: ${LOG_LEVEL:-info}
     ports:
-      - "${REMORA_PORT:-8080}:8080"
+      # loopback only by default: put a TLS reverse proxy in front (see README) before exposing it
+      - "127.0.0.1:${REMORA_PORT:-8080}:8080"
     volumes:
       - plugins:/plugins
     depends_on:

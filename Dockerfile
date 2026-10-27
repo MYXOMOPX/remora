@@ -11,10 +11,17 @@ RUN npm run build && npm prune --omit=dev
 
 FROM node:24-bookworm-slim AS runtime
 WORKDIR /app
-ENV NODE_ENV=production PLUGINS_DIR=/plugins PORT=8080
+ENV NODE_ENV=production PLUGINS_DIR=/plugins PORT=8080 HOST=0.0.0.0
 COPY --from=build /app/package.json /app/
 COPY --from=build /app/node_modules /app/node_modules
-COPY --from=build /app/packages /app/packages
+# only what runs: package.json + dist per package, and the SQL migrations (no sources, tests or tsconfigs)
+COPY --from=build /app/packages/sdk/package.json /app/packages/sdk/
+COPY --from=build /app/packages/sdk/dist /app/packages/sdk/dist
+COPY --from=build /app/packages/core-plugin/package.json /app/packages/core-plugin/
+COPY --from=build /app/packages/core-plugin/dist /app/packages/core-plugin/dist
+COPY --from=build /app/packages/server/package.json /app/packages/server/
+COPY --from=build /app/packages/server/dist /app/packages/server/dist
+COPY --from=build /app/packages/server/migrations /app/packages/server/migrations
 RUN mkdir -p /plugins && chown node:node /plugins
 VOLUME /plugins
 USER node

@@ -15,7 +15,7 @@ Transport, contract and packaging (plan 4): remora becomes a runnable service.
 - Startup under a PostgreSQL advisory lock, so replicas starting together are serialised. `statement_timeout` (`REMORA_STATEMENT_TIMEOUT_MS`) with a typed `timeout` error.
 - New error codes `internal` (unexpected transport failure) and `timeout`.
 - Explicit `null` as a time bound is `invalid_time` (omit the bound instead).
-- Environment configuration, `gen-secret` command, `tsc` build with `dist/` output and a `source` export condition for development, Dockerfile (non-root, Node 24), `docker-compose.yml` with PostgreSQL 18, volumes for data and plugins, a Docker smoke script.
+- Environment configuration, `gen-secret` command, `tsc` build with `dist/` output and a `remora-source` export condition for development, Dockerfile (non-root, Node 24), `docker-compose.yml` with PostgreSQL 18, volumes for data and plugins, a Docker smoke script.
 - Root README with concepts, quick start, API overview, security model, backup, upgrade and plugin operations.
 
 ### Fixed
@@ -25,6 +25,9 @@ Transport, contract and packaging (plan 4): remora becomes a runnable service.
 - A plugin whose package name differs from its stored row, or that declares an axis or source owned by another plugin, is rejected before anything is written.
 
 ### Notes for upgrading and operating
+- Security defaults: the service listens on `127.0.0.1` unless `HOST` is set (the image sets `0.0.0.0`); compose publishes the port on `127.0.0.1` only and takes the database password from `POSTGRES_PASSWORD` in `.env` (required). `.env` files are git-ignored.
+- HTTP statuses: `408` when the request body is not received within `REMORA_REQUEST_TIMEOUT_MS`; `GET /health` answers `503` with `{"status":"unavailable"}` when the database is unreachable. Request bodies nested deeper than 64 levels are `400 invalid_param`. JSON-RPC batch arrays on the MCP route are rejected (`-32600`).
+- New settings `REMORA_DB_CONNECT_TIMEOUT_MS` (default 10000) and `REMORA_MAX_CONNECTIONS` (default 1024).
 - The shutdown 503 (requests arriving after `SIGTERM`) uses the code `internal` with `details.reason: "shutting_down"`.
 - `set_plugin_config` validates the config against the module already loaded in memory; a newer package version on disk is seen only after a restart. A plugin is listed as `pending_restart` by name when its row was added after the process loaded plugins.
 - Installations created before 1.0.0 keep the core plugin config stored in their database, which has no `chat_message` evidence source; `add_evidence source: "chat_message"` works only on fresh installs unless the stored config of `remora-core` is extended with that source through `set_plugin_config` (not yet verified on an upgraded database).

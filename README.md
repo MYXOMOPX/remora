@@ -18,7 +18,8 @@ Version 1.0.0. Design: [`docs/superpowers/specs/2026-10-22-historicity-design.md
 
 ```bash
 cp .env.example .env
-# put two different generated secrets into REMORA_SECRET and REMORA_ADMIN_SECRET (see "Secret generation")
+# put two different generated secrets into REMORA_SECRET and REMORA_ADMIN_SECRET and a generated
+# POSTGRES_PASSWORD (see "Secret generation")
 docker compose up -d --build --wait
 curl -s localhost:8080/health          # {"status":"ok"}
 ```
@@ -37,7 +38,7 @@ npm run build          # sdk -> core-plugin -> server, output in packages/*/dist
 DATABASE_URL=postgres://user:pass@localhost:5432/remora REMORA_SECRET=$(npm run -s gen-secret) npm start
 ```
 
-Packages: `@remora/sdk` (types, error codes, plugin shapes), `@remora/core-plugin` (declarative axes and sources), `@remora/server` (services, contract, HTTP, MCP, admin). During development and tests packages resolve from `src` through the `source` export condition; `node` uses `dist`.
+Packages: `@remora/sdk` (types, error codes, plugin shapes), `@remora/core-plugin` (declarative axes and sources), `@remora/server` (services, contract, HTTP, MCP, admin). During development and tests packages resolve from `src` through the `remora-source` export condition; `node` uses `dist`.
 
 ## API overview
 
@@ -146,11 +147,12 @@ Failure envelope (the whole batch is rolled back; `op_index` is the failing op, 
 | 200 | `ok: true` |
 | 400 | `invalid_param`, `invalid_time`, `invalid_name`, `invalid_payload`, `value_type_mismatch`, `unknown_ref`, `invalid_config`, `invalid_plugin` |
 | 404 | `not_found`, `unknown_entity`, `unknown_type`, `unknown_axis`, `unknown_source`; also any wrong secret or unknown path |
-| 405 / 413 / 415 | wrong method / body above `REMORA_MAX_BODY_BYTES` / `Content-Type` is not `application/json` (envelope code `invalid_param`) |
+| 400 (request itself) | not JSON, not UTF-8, nested deeper than 64 levels, or incomplete body (envelope code `invalid_param`, `op_index: -1`) |
+| 405 / 408 / 413 / 415 | wrong method / body not received within the request timeout (`REMORA_REQUEST_TIMEOUT_MS`) / body above `REMORA_MAX_BODY_BYTES` / `Content-Type` is not `application/json` (envelope code `invalid_param`) |
 | 409 | `single_valued_conflict`, `timeless_conflict`, `name_taken`, `concurrent_update` (retry the batch) |
 | 422 | `too_many_paths` |
 | 500 | `internal` (unexpected failure; the stack is only in the server log, `details.request_id` correlates) |
-| 503 | `axis_unavailable`, `source_unavailable` (plugin failed to load); during shutdown `internal` with `details.reason: "shutting_down"` |
+| 503 | `axis_unavailable`, `source_unavailable` (plugin failed to load); `GET /health` `unavailable` (database unreachable, body `{"status":"unavailable"}`); during shutdown `internal` with `details.reason: "shutting_down"` |
 | 504 | `timeout` (PostgreSQL `statement_timeout`; the batch was rolled back, narrow the request) |
 
 Every response carries an `x-request-id` header.
@@ -159,7 +161,8 @@ Every response carries an `x-request-id` header.
 
 - **Secret URL.** There are no users and no tokens: whoever knows `REMORA_SECRET` can read and write everything in the database (one secret = one database, no roles). The secret is a path segment of at least 43 characters of `[A-Za-z0-9_-]`, compared in constant time; a wrong or missing secret gets the same 404 as an unknown path. Secrets and request bodies are not logged (the access log writes the route as `/:secret/apply`). Treat the URL like a password.
 - **Admin secret.** Operator ops (plugins, evidence retention, purge, pin) live under a second, different secret, `REMORA_ADMIN_SECRET`, at `/<admin secret>/admin/<op>`. If it is unset the admin API is disabled. It is not exposed through MCP; give LLM clients only the LLM URL.
-- **Transport.** The service speaks plain HTTP and the secret is part of the URL, so terminate TLS in a reverse proxy and do not expose the port to untrusted networks. The compose file publishes `REMORA_PORT` on all host interfaces; restrict it with a firewall, or change the mapping to `127.0.0.1:${REMORA_PORT:-8080}:8080` when the proxy runs on the same host. The database port is not published.
+- **Transport.** The service speaks plain HTTP and the secret is part of the URL, so terminate TLS in a reverse proxy and do not expose the port to untrusted networks. The compose file publishes `REMORA_PORT` on `127.0.0.1` only, and the service itself listens on `127.0.0.1` unless `HOST` says otherwise (the image sets `HOST=0.0.0.0` so the published port works). See "Exposing the service" for a reverse proxy. The database port is not published, and its password comes from `POSTGRES_PASSWORD` in `.env`.
+- **MCP.** JSON-RPC batch arrays are rejected on the MCP route (`-32600`): one request is one call.
 - **Plugin trust.** A plugin is Node.js code loaded into the service process and runs with its privileges (no sandbox). Install only packages you trust. The admin API only registers packages that are already installed in the plugin directory.
 - There is no rate limiting in v1 (a reverse proxy can add it).
 
@@ -174,7 +177,7 @@ docker compose up -d --build --wait
 curl -s localhost:8080/health          # {"status":"ok"}
 ```
 
-Compose starts `db` (PostgreSQL 18, volume `pgdata`) and `remora` (non-root user, port `REMORA_PORT`, default 8080, plugins volume `plugins` mounted at `/plugins`). Migrations and the core plugin are applied at start; two replicas starting together are serialised by an advisory lock.
+Compose starts `db` (PostgreSQL 18, volume `pgdata`) and `remora` (non-root user, port `REMORA_PORT`, default 8080, published on `127.0.0.1` only, plugins volume `plugins` mounted at `/plugins`). Migrations and the core plugin are applied at start; two replicas starting together are serialised by an advisory lock.
 
 Try it (`$REMORA_SECRET` is the value from `.env`):
 
@@ -187,6 +190,10 @@ curl -s localhost:8080/$REMORA_SECRET/schema      # the JSON Schema contract
 Endpoints: `POST /<secret>/apply`, `POST /<secret>/query`, `GET /<secret>/schema`, `POST /<secret>/mcp`, `GET /health` (no secret), operator API under `/<admin secret>/admin/<op>`. A wrong or missing secret returns the same 404 as an unknown path. TLS is expected from a reverse proxy; the secret is part of the URL, so do not expose the port over plain HTTP outside a trusted network.
 
 Smoke test of the whole image (build, HTTP, MCP, plugin flow, graceful `docker stop`; removes everything it creates; not part of `npm test`): `bash scripts/docker-smoke.sh`.
+
+### Exposing the service
+
+By default only the local host can reach the port. To serve other machines, run a TLS reverse proxy (Caddy, nginx, Traefik) on the same host and forward to `127.0.0.1:${REMORA_PORT}`; or put the proxy in the compose network and forward to `remora:8080`. Only if the host's network is trusted, change the mapping in `docker-compose.yml` to `"0.0.0.0:${REMORA_PORT:-8080}:8080"` (or another address). The secret is part of the URL, so never expose plain HTTP to the Internet.
 
 ### Backup
 
@@ -214,7 +221,7 @@ On `SIGTERM`/`SIGINT` the service stops accepting, answers new requests on open 
 
 ## Configuration
 
-All configuration is by environment variable. Compose reads `REMORA_SECRET`, `REMORA_ADMIN_SECRET`, `REMORA_PORT` and `LOG_LEVEL` from `.env`; to set other variables add them to the `remora` service `environment` in `docker-compose.yml`.
+All configuration is by environment variable. Compose reads `REMORA_SECRET`, `REMORA_ADMIN_SECRET`, `POSTGRES_PASSWORD`, `REMORA_PORT` and `LOG_LEVEL` from `.env`; to set other variables add them to the `remora` service `environment` in `docker-compose.yml`.
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -222,7 +229,8 @@ All configuration is by environment variable. Compose reads `REMORA_SECRET`, `RE
 | `REMORA_SECRET` | required | Secret path segment of the LLM API. At least 43 chars of `[A-Za-z0-9_-]`. |
 | `REMORA_ADMIN_SECRET` | unset | Secret path segment of the operator API; same format, must differ from `REMORA_SECRET`. Unset disables `/admin` routes. |
 | `PORT` | `8080` | Listen port inside the container. |
-| `HOST` | `0.0.0.0` | Listen address. |
+| `HOST` | `127.0.0.1` (the Docker image sets `0.0.0.0`) | Listen address. |
+| `POSTGRES_PASSWORD` | required by compose | Password of the compose database (and in its `DATABASE_URL`); generate it like the secrets. Compose refuses to start without it. |
 | `REMORA_PORT` | `8080` | Host port published by compose. |
 | `PLUGINS_DIR` | `/plugins` in the image, `<cwd>/plugins` otherwise | Where plugins are installed. |
 | `LOG_LEVEL` | `info` | `debug`, `info`, `warn` or `error`. JSON lines on stdout. |
@@ -230,6 +238,8 @@ All configuration is by environment variable. Compose reads `REMORA_SECRET`, `RE
 | `REMORA_REQUEST_TIMEOUT_MS` | `30000` | HTTP request timeout. |
 | `REMORA_STATEMENT_TIMEOUT_MS` | `30000` | PostgreSQL `statement_timeout`; `0` disables. A timed-out batch is rolled back (`timeout`). |
 | `REMORA_SHUTDOWN_TIMEOUT_MS` | `10000` | How long shutdown waits for in-flight requests. |
+| `REMORA_DB_CONNECT_TIMEOUT_MS` | `10000` | How long a request waits for a database connection (pool `connectionTimeoutMillis`); on expiry the request fails instead of queueing forever. |
+| `REMORA_MAX_CONNECTIONS` | `1024` | Maximum simultaneous HTTP connections; further ones are dropped. |
 
 ### Secret generation
 
@@ -239,7 +249,7 @@ Each secret is 32 random bytes in base64url. Without a checkout:
 docker run --rm node:24-bookworm-slim node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"
 ```
 
-From a built checkout: `npm run gen-secret`; from a running container: `docker compose exec remora node packages/server/dist/main.js gen-secret`. Generate one for `REMORA_SECRET` and a different one for `REMORA_ADMIN_SECRET`. Never commit `.env`.
+From a built checkout: `npm run gen-secret`; from a running container: `docker compose exec remora node packages/server/dist/main.js gen-secret`. Generate one for `REMORA_SECRET`, a different one for `REMORA_ADMIN_SECRET`, and one for `POSTGRES_PASSWORD` (base64url is URL-safe). Never commit `.env`.
 
 ## MCP clients
 
