@@ -84,9 +84,17 @@ function comparePaths(x: PathRec, y: PathRec): number {
   return 0;
 }
 
-function pathEdge(side: 'src' | 'dst', other: 'dst' | 'src', typesParam: number, whenSql: string): string {
-  return `SELECT rel.${other} AS next, rel.id AS rid FROM relation rel
-      WHERE rel.${side} = p.entity_id AND rel.relation_type_id = ANY($${typesParam}::smallint[])
+/** One traversal step from the lateral alias `from`: columns `next` and, when asked, `rid` (relation row id). */
+function edgeSql(
+  from: 'p' | 'r',
+  side: 'src' | 'dst',
+  other: 'dst' | 'src',
+  typesParam: number,
+  whenSql: string,
+  withRid: boolean,
+): string {
+  return `SELECT rel.${other} AS next${withRid ? ', rel.id AS rid' : ''} FROM relation rel
+      WHERE rel.${side} = ${from}.entity_id AND rel.relation_type_id = ANY($${typesParam}::smallint[])
         AND rel.retracted_at IS NULL AND ${whenSql}`;
 }
 
@@ -126,10 +134,6 @@ export async function neighbors(
 
   // 1. levels: min depth per reachable entity (includes the start at 0).
   const w = whenClause(a.when, 5);
-  const edge = (side: 'src' | 'dst', other: 'dst' | 'src', typesParam: number): string =>
-    `SELECT rel.${other} AS next FROM relation rel
-      WHERE rel.${side} = r.entity_id AND rel.relation_type_id = ANY($${typesParam}::smallint[])
-        AND rel.retracted_at IS NULL AND ${w.sql}`;
   const startId = start.entityId.toString();
   const pathsByEntity = new Map<string, PathRec[]>();
   let levels: Level[];
@@ -142,9 +146,9 @@ export async function neighbors(
          SELECT n.next, p.depth + 1, p.nodes || n.next, p.rels || n.rid
            FROM paths p
           CROSS JOIN LATERAL (
-            ${pathEdge('src', 'dst', 2, w.sql)}
+            ${edgeSql('p', 'src', 'dst', 2, w.sql, true)}
             UNION ALL
-            ${pathEdge('dst', 'src', 3, w.sql)}
+            ${edgeSql('p', 'dst', 'src', 3, w.sql, true)}
           ) n
           WHERE p.depth < $4::int AND NOT n.next = ANY(p.nodes)
        )
@@ -162,7 +166,9 @@ export async function neighbors(
       pathsByEntity.set(r.entity_id, list);
     }
     levels = [{ id: startId, depth: 0 }];
-    for (const [id, list] of pathsByEntity) levels.push({ id, depth: Math.min(...list.map((p) => p.rels.length)) });
+    for (const [id, list] of pathsByEntity) {
+      levels.push({ id, depth: list.reduce((m, p) => Math.min(m, p.rels.length), Infinity) });
+    }
   } else {
     const levelRes = await db.query<{ entity_id: string; depth: number }>(
       `WITH RECURSIVE reach(entity_id, depth) AS (
@@ -171,9 +177,9 @@ export async function neighbors(
          SELECT n.next, r.depth + 1
            FROM reach r
           CROSS JOIN LATERAL (
-            ${edge('src', 'dst', 2)}
+            ${edgeSql('r', 'src', 'dst', 2, w.sql, false)}
             UNION ALL
-            ${edge('dst', 'src', 3)}
+            ${edgeSql('r', 'dst', 'src', 3, w.sql, false)}
           ) n
           WHERE r.depth < $4::int
        )
@@ -308,7 +314,7 @@ export async function neighbors(
     }
   }
 
-  // 4. properties for the page.
+  // 4. properties for the page. `include: []` yields an empty `properties` object on every row.
   if (a.include !== undefined) {
     for (const row of rows) {
       row.properties = Object.fromEntries(included.map((p) => [p.name, [] as unknown[]]));
@@ -319,7 +325,7 @@ export async function neighbors(
         `SELECT pv.entity_id, pt.name, pv.value
            FROM property_version pv JOIN property_type pt ON pt.id = pv.property_type_id
           WHERE pv.entity_id = ANY($1::bigint[]) AND pv.property_type_id = ANY($2::smallint[])
-            AND pv.retracted_at IS NULL AND ${pw.sql.replace(/\b(time_axis|time_span)\b/g, 'pv.$1')}
+            AND pv.retracted_at IS NULL AND ${pw.sql}
           ORDER BY pv.id`,
         [pageIds, included.map((p) => p.id), ...pw.params],
       );

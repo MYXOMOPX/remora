@@ -146,6 +146,62 @@ describe('neighbors', () => {
     });
   });
 
+  it('undirected edge is traversed from the dst side, via.from is the traversal predecessor', async () => {
+    await withDb(async ({ nb }) => {
+      // carl -> dave is stored src=carl, dst=dave; walking from dave uses the dst side
+      const r = await nb({ entity: 'dave', relationTypes: ['friend_of'] });
+      expect(names(r)).toEqual(['carl']);
+      expect(r.rows[0]!.via).toMatchObject({ relation: 'friend_of', from: 'dave' });
+      expect(r.rows[0]!.viaCount).toBe(1);
+    });
+  });
+
+  it("via.from under direction 'in' names the entity walked from", async () => {
+    await withDb(async ({ nb }) => {
+      const r = await nb({ direction: 'in', relationTypes: ['knows'] });
+      expect(names(r)).toEqual(['dave', 'erin']);
+      for (const row of r.rows) expect(row.via).toMatchObject({ relation: 'knows', from: 'bob' });
+    });
+  });
+
+  it('self-loops neither list the entity itself nor change counts', async () => {
+    await withDb(async ({ pool, reg, nb }) => {
+      const r = await apply(pool, reg, {
+        ops: [
+          { op: 'add_relation', type: 'friend_of', from: 'carl', to: 'carl' },
+          { op: 'add_relation', type: 'friend_of', from: 'bob', to: 'bob' },
+        ],
+      });
+      expect(r.ok).toBe(true);
+      const plain = await nb({ depth: 2 });
+      expect(names(plain)).toEqual(['acme', 'carl', 'dave', 'erin', 'google']);
+      expect(plain.rows.find((x) => x.entity === 'carl')!.viaCount).toBe(2);
+      const paths = await nb({ relationTypes: ['friend_of'], depth: 3, paths: true });
+      expect(names(paths)).toEqual(['carl', 'dave']);
+      expect(paths.rows[0]!.paths).toHaveLength(2);
+    });
+  });
+
+  it('include: [] adds an empty properties object to every row', async () => {
+    await withDb(async ({ nb }) => {
+      const r = await nb({ include: [] });
+      expect(r.rows.every((x) => JSON.stringify(x.properties) === '{}')).toBe(true);
+    });
+  });
+
+  it('include honours when for property versions', async () => {
+    await withDb(async ({ pool, reg, nb }) => {
+      const r = await apply(pool, reg, {
+        ops: [{ op: 'add_property', entity: 'carl', property: 'nickname', value: 'c1', time: gd(500, 600) }],
+      });
+      expect(r.ok).toBe(true);
+      const hit = await nb({ include: ['nickname'], when: { axis: 'game_day', at: 550 } });
+      expect(hit.rows.find((x) => x.entity === 'carl')!.properties).toEqual({ nickname: ['c1'] });
+      const miss = await nb({ include: ['nickname'], when: { axis: 'game_day', at: 10 } });
+      expect(miss.rows.find((x) => x.entity === 'carl')!.properties).toEqual({ nickname: [] });
+    });
+  });
+
   it('order_by sorts before limit, missing values last', async () => {
     await withDb(async ({ nb }) => {
       const r = await nb({ orderBy: { property: 'height', dir: 'desc' }, limit: 1 });
@@ -238,6 +294,18 @@ describe('neighbors paths', () => {
     });
   });
 
+  it('when drops individual paths', async () => {
+    await withDb(async ({ nb }) => {
+      const all = await nb({ relationTypes: ['friend_of'], paths: true });
+      expect(all.rows[0]!.paths).toHaveLength(2);
+      // bob-carl exists once timeless and once from game day 100: day 50 only matches the timeless row
+      const r = await nb({ relationTypes: ['friend_of'], paths: true, when: { axis: 'game_day', at: 50 } });
+      expect(names(r)).toEqual(['carl']);
+      expect(r.rows[0]!.paths).toHaveLength(1);
+      expect(r.rows[0]!.paths![0]![0]!.time).toBeNull();
+    });
+  });
+
   it('ranks entities with order_by and limit', async () => {
     await withDb(async ({ nb }) => {
       const r = await nb({
@@ -288,13 +356,14 @@ describe('neighbors paths', () => {
     await pool.query(
       `WITH t AS (SELECT id FROM relation_type WHERE name = 'knows'),
             hub AS (SELECT entity_id FROM entity WHERE key = 'hub'),
-            ms AS (SELECT entity_id FROM entity WHERE key LIKE 'm%'),
-            ls AS (SELECT entity_id FROM entity WHERE key LIKE 'l%'),
+            ms AS (SELECT entity_id FROM entity WHERE key IN (SELECT 'm' || g FROM generate_series(1, 100) g)),
+            ls AS (SELECT entity_id FROM entity WHERE key IN (SELECT 'l' || g FROM generate_series(1, $1::int) g)),
             pairs AS (
               SELECT hub.entity_id AS s, ms.entity_id AS d FROM hub, ms
               UNION ALL SELECT ms.entity_id, ls.entity_id FROM ms, ls)
        INSERT INTO relation (relation_id, relation_type_id, src, dst)
        SELECT row_number() OVER () + 1000000, t.id, pairs.s, pairs.d FROM pairs, t`,
+      [leaves],
     );
   }
 
