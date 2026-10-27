@@ -1,0 +1,35 @@
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: remora
+      POSTGRES_PASSWORD: remora
+      POSTGRES_DB: remora
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U remora -d remora"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  remora:
+    build: .
+    environment:
+      DATABASE_URL: postgres://remora:remora@db:5432/remora
+      REMORA_SECRET: ${REMORA_SECRET:?set REMORA_SECRET in .env}
+      REMORA_ADMIN_SECRET: ${REMORA_ADMIN_SECRET:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${REMORA_PORT:-8080}:8080"
+    volumes:
+      - plugins:/plugins
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  plugins:
