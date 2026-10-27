@@ -172,6 +172,7 @@ export async function loadPlugins(
 
   for (const p of plugins) {
     let setupResult: ReturnType<PluginDef['setup']>;
+    let registered: { axes: AxisInfo[]; sources: SourceInfo[] };
     try {
       let def: PluginDef;
       try {
@@ -188,6 +189,7 @@ export async function loadPlugins(
       assertUniqueNames(setupResult, p.name);
       for (const a of setupResult.timeAxes ?? []) await assertNameFree(db, 'time_axis', a.name, p.id);
       for (const s of setupResult.evidenceSources ?? []) await assertNameFree(db, 'evidence_source', s.name, p.id);
+      registered = await upsertPluginRows(db, p.id, setupResult);
     } catch (e) {
       if (p.name === CORE_PLUGIN_NAME) {
         if (e instanceof RemoraError && e.code === 'name_taken') throw e;
@@ -201,31 +203,8 @@ export async function loadPlugins(
       continue;
     }
 
-    for (const a of setupResult.timeAxes ?? []) {
-      const r = await db.query<{ id: number }>(
-        `INSERT INTO time_axis (name, plugin_id, description, value_schema, example)
-         VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
-         ON CONFLICT (name) DO UPDATE SET
-           description = EXCLUDED.description,
-           value_schema = EXCLUDED.value_schema,
-           example = EXCLUDED.example
-         RETURNING id`,
-        [a.name, p.id, a.description, JSON.stringify(a.valueSchema), JSON.stringify(a.example)],
-      );
-      axes.set(a.name, { id: r.rows[0]!.id, name: a.name, def: a });
-    }
-    for (const s of setupResult.evidenceSources ?? ([] as EvidenceSourceDef[])) {
-      const r = await db.query<{ id: number }>(
-        `INSERT INTO evidence_source (name, plugin_id, description, payload_schema)
-         VALUES ($1, $2, $3, $4::jsonb)
-         ON CONFLICT (name) DO UPDATE SET
-           description = EXCLUDED.description,
-           payload_schema = EXCLUDED.payload_schema
-         RETURNING id`,
-        [s.name, p.id, s.description, JSON.stringify(s.payloadSchema)],
-      );
-      sources.set(s.name, { id: r.rows[0]!.id, name: s.name, def: s });
-    }
+    for (const a of registered.axes) axes.set(a.name, a);
+    for (const x of registered.sources) sources.set(x.name, x);
     statuses.push({ name: p.name, ok: true });
   }
 
@@ -271,6 +250,53 @@ export async function loadPlugins(
       throw new RemoraError('unknown_axis', `unknown time axis ${name}`);
     },
     status: () => statuses.map((s) => ({ ...s })),
+  };
+}
+
+/**
+ * Upserts one plugin's axes and sources in a single statement (data-modifying CTEs), so a failure
+ * leaves no partial rows and needs no connection-bound transaction (`db` may be a pool).
+ */
+async function upsertPluginRows(
+  db: Queryable,
+  pluginId: number,
+  setup: ReturnType<PluginDef['setup']>,
+): Promise<{ axes: AxisInfo[]; sources: SourceInfo[] }> {
+  const timeAxes = setup.timeAxes ?? [];
+  const evidenceSources = setup.evidenceSources ?? [];
+  if (timeAxes.length === 0 && evidenceSources.length === 0) return { axes: [], sources: [] };
+  const axisRows = JSON.stringify(
+    timeAxes.map((a) => ({ name: a.name, description: a.description, value_schema: a.valueSchema, example: a.example })),
+  );
+  const sourceRows = JSON.stringify(
+    evidenceSources.map((s) => ({ name: s.name, description: s.description, payload_schema: s.payloadSchema })),
+  );
+  const { rows } = await db.query<{ kind: string; id: number; name: string }>(
+    `WITH ax AS (
+       INSERT INTO time_axis (name, plugin_id, description, value_schema, example)
+       SELECT r.name, $1, r.description, r.value_schema, r.example
+         FROM jsonb_to_recordset($2::jsonb) AS r(name text, description text, value_schema jsonb, example jsonb)
+       ON CONFLICT (name) DO UPDATE SET
+         description = EXCLUDED.description,
+         value_schema = EXCLUDED.value_schema,
+         example = EXCLUDED.example
+       RETURNING id, name
+     ), src AS (
+       INSERT INTO evidence_source (name, plugin_id, description, payload_schema)
+       SELECT r.name, $1, r.description, r.payload_schema
+         FROM jsonb_to_recordset($3::jsonb) AS r(name text, description text, payload_schema jsonb)
+       ON CONFLICT (name) DO UPDATE SET
+         description = EXCLUDED.description,
+         payload_schema = EXCLUDED.payload_schema
+       RETURNING id, name
+     )
+     SELECT 'a' AS kind, id, name FROM ax UNION ALL SELECT 's', id, name FROM src`,
+    [pluginId, axisRows, sourceRows],
+  );
+  const idOf = (kind: string, name: string): number => rows.find((r) => r.kind === kind && r.name === name)!.id;
+  return {
+    axes: timeAxes.map((a) => ({ id: idOf('a', a.name), name: a.name, def: a })),
+    sources: evidenceSources.map((s) => ({ id: idOf('s', s.name), name: s.name, def: s })),
   };
 }
 

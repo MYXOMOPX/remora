@@ -23,12 +23,24 @@ function lines(child: ChildProcess): AsyncIterable<string> {
 
 function exited(child: ChildProcess, ms: number): Promise<number | null> {
   return new Promise((res, rej) => {
+    // the child may already be gone (its output ended before we got here): 'exit' would never fire again
+    if (child.exitCode !== null) return res(child.exitCode);
+    if (child.signalCode !== null) return res(null);
     const t = setTimeout(() => rej(new Error('child did not exit in time')), ms);
     child.once('exit', (code) => {
       clearTimeout(t);
       res(code);
     });
   });
+}
+
+/** Waits for the "listening" log line and returns the port. */
+async function listening(child: ChildProcess): Promise<number> {
+  for await (const l of lines(child)) {
+    const rec = JSON.parse(l) as { msg: string; port?: number };
+    if (rec.msg === 'listening') return rec.port!;
+  }
+  throw new Error('child exited before listening');
 }
 
 describe('built output under plain node', () => {
@@ -132,19 +144,29 @@ describe('built output under plain node', () => {
     expect(await exited(child, 10_000)).toBe(0);
   }, 60_000);
 
-  it('loads the registered package plugin by name after a restart', async () => {
-    // second boot: the plugin registered above is loaded by name from PLUGINS_DIR under plain node
+  it('loads a registered package plugin by name after a restart', async () => {
+    // self-contained: boot 1 registers the plugin through the admin API, boot 2 loads it by name from PLUGINS_DIR
     const secret = generateSecret();
-    const child = runMain([], { DATABASE_URL: db.url, PORT: '0', HOST: '127.0.0.1', REMORA_SECRET: secret, PLUGINS_DIR: plugins });
+    const adminSecret = generateSecret();
+    const env = { DATABASE_URL: db.url, PORT: '0', HOST: '127.0.0.1', REMORA_SECRET: secret, REMORA_ADMIN_SECRET: adminSecret, PLUGINS_DIR: plugins };
+    const first = runMain([], env);
     try {
-      let port = 0;
-      for await (const l of lines(child)) {
-        const rec = JSON.parse(l) as { msg: string; port?: number };
-        if (rec.msg === 'listening') {
-          port = rec.port!;
-          break;
-        }
-      }
+      const port = await listening(first);
+      const added = await fetch(`http://127.0.0.1:${port}/${adminSecret}/admin/add_plugin`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ package: 'remora-plugin-smoke' }),
+      });
+      // 409/400 would mean an earlier test already registered it; the restart below still has to find the axis
+      expect([200, 400, 409]).toContain(added.status);
+    } finally {
+      first.kill();
+    }
+    await exited(first, 10_000);
+
+    const child = runMain([], env);
+    try {
+      const port = await listening(child);
       const res = await fetch(`http://127.0.0.1:${port}/${secret}/query`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },

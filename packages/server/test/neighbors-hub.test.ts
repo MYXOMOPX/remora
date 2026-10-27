@@ -13,6 +13,9 @@ describe('neighbors on a hub (no ANALYZE)', () => {
     const { pool, drop } = await createTestDb();
     try {
       await runMigrations(pool);
+      // no statistics may appear mid-test (autovacuum/autoanalyze would make the plan problem vanish)
+      await pool.query(`ALTER TABLE relation SET (autovacuum_enabled = false)`);
+      await pool.query(`ALTER TABLE entity SET (autovacuum_enabled = false)`);
       const seeded = await seedBasics(pool);
       const reg = await seedAxes(pool, seeded);
       await pool.query(
@@ -45,6 +48,7 @@ describe('neighbors on a hub (no ANALYZE)', () => {
       expect(d2.rows[0]!.entity).toBe('hub');
       expect(d2.rows[0]!.depth).toBe(1);
       expect(d2.rows[0]!.via?.from).toBe('s');
+      expect(d2.rows[0]!.viaCount).toBe(1);
       expect(d2.rows).toHaveLength(50);
       for (const row of d2.rows.slice(1)) {
         expect(row.entity.startsWith('l')).toBe(true);
@@ -56,6 +60,13 @@ describe('neighbors on a hub (no ANALYZE)', () => {
 
       for (const depth of [3, 4, 6]) expect((await timed({ depth })).total).toBe(2 * N + 1);
       expect((await timed({ depth: 6, direction: 'out' })).total).toBe(2 * N + 1);
+      // the walk back from a leaf end: every step has a via, down to the start of the chain
+      const back = await timed({ entity: 'c1', depth: 6, direction: 'in' });
+      expect(back.rows.map((r) => [r.entity, r.depth, r.via?.from, r.viaCount])).toEqual([
+        ['l1', 1, 'c1', 1],
+        ['hub', 2, 'l1', 1],
+        ['s', 3, 'hub', 1],
+      ]);
       await timed({ depth: 2, orderBy: { property: 'height', dir: 'desc' } });
       await timed({ depth: 2, include: ['height'] });
     } finally {

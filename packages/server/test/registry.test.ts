@@ -227,6 +227,25 @@ describe('plugin registry', () => {
     });
   });
 
+  it('a failing upsert leaves no partial rows and degrades only that plugin', async () => {
+    await withDb(async (pool) => {
+      await insertPlugin(pool, 'p1');
+      await insertPlugin(pool, 'p2');
+      const logger = { warn: vi.fn(), error: vi.fn() };
+      // the second axis description cannot be stored (NUL in jsonb), after the first one is valid
+      const p2 = plug('p2', [], { setup: () => ({ timeAxes: [axis('good_axis'), axis('bad_axis', 'nul   byte')] }) });
+      const reg = await loadPlugins(pool, { importer: importerOf({ p1: plug('p1', ['day']), p2 }), logger });
+      expect(reg.status()).toEqual([
+        { name: 'p1', ok: true },
+        { name: 'p2', ok: false, error: expect.any(String) },
+      ]);
+      const { rows } = await pool.query(`SELECT name FROM time_axis ORDER BY name`);
+      expect(rows).toEqual([{ name: 'day' }]);
+      expect(reg.getAxis('day').name).toBe('day');
+      expect(() => reg.getAxis('good_axis')).toThrow(code('unknown_axis'));
+    });
+  });
+
   it('a non-core plugin declaring an axis owned by another plugin is degraded with name_taken', async () => {
     await withDb(async (pool) => {
       await insertPlugin(pool, 'p1');
@@ -241,6 +260,10 @@ describe('plugin registry', () => {
         { name: 'p2', ok: false, error: expect.stringContaining('name_taken') },
       ]);
       expect(reg.getAxis('day').def.name).toBe('day');
+      const owner = await pool.query(
+        `SELECT p.name FROM time_axis a JOIN plugin p ON p.id = a.plugin_id WHERE a.name = 'day'`,
+      );
+      expect(owner.rows).toEqual([{ name: 'p1' }]);
       const { rows } = await pool.query(
         `SELECT a.name FROM time_axis a JOIN plugin p ON p.id = a.plugin_id WHERE p.name = 'p2'`,
       );
