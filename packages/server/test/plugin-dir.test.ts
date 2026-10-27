@@ -1,6 +1,9 @@
+import { execFile } from 'node:child_process';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { promisify } from 'node:util';
 import { describe, expect, it } from 'vitest';
 import { startRemora, type RemoraApp } from '../src/app.js';
 import { createTestDb } from './helpers/testDb.js';
@@ -30,6 +33,23 @@ async function fixtures(): Promise<string> {
   await mkdir(join(dir, 'pkgdir'), { recursive: true });
   await writeFile(join(dir, 'pkgdir', 'package.json'), JSON.stringify({ name: 'pkgdir', type: 'module', main: 'main.js' }));
   await writeFile(join(dir, 'pkgdir', 'main.js'), pluginSource('star', 'star_age'));
+  const scoped = join(dir, 'node_modules', '@acme', 'remora-plugin-tide');
+  await mkdir(scoped, { recursive: true });
+  await writeFile(join(scoped, 'package.json'), JSON.stringify({ name: '@acme/remora-plugin-tide', type: 'module', main: 'tide.js' }));
+  await writeFile(join(scoped, 'tide.js'), pluginSource('tide', 'tide_level'));
+  const forms: [string, unknown, string][] = [
+    ['exp-import', { '.': { import: './i.js' } }, 'i.js'],
+    ['exp-default', { '.': { default: './d.js' } }, 'd.js'],
+    ['exp-cond', { import: './c.js' }, 'c.js'],
+    ['exp-str', { '.': './s.js' }, 's.js'],
+  ];
+  for (const [d, exp, file] of forms) {
+    await mkdir(join(dir, d), { recursive: true });
+    await writeFile(join(dir, d, 'package.json'), JSON.stringify({ name: d, type: 'module', exports: exp }));
+    await writeFile(join(dir, d, file), pluginSource(d.replace('-', '_'), `${d.replace('-', '_')}_axis`));
+  }
+  await mkdir(join(dir, 'badjson'), { recursive: true });
+  await writeFile(join(dir, 'badjson', 'package.json'), '{nope');
   await mkdir(join(dir, 'thrower'), { recursive: true });
   await writeFile(join(dir, 'thrower', 'index.js'), `throw new Error('boom');\nexport default {};\n`);
   return dir;
@@ -119,5 +139,71 @@ describe('plugin directory loading', () => {
         expect(await writeWith(app, 'game_day')).toEqual({ ok: true });
       });
     });
+  });
+
+  it.each([
+    ['@acme/remora-plugin-tide', 'tide', 'tide_level'],
+    ['./exp-import', 'exp_import', 'exp_import_axis'],
+    ['./exp-default', 'exp_default', 'exp_default_axis'],
+    ['./exp-cond', 'exp_cond', 'exp_cond_axis'],
+    ['./exp-str', 'exp_str', 'exp_str_axis'],
+  ])('loads %s', async (spec, name, axis) => {
+    await withEnv(async ({ url, dir }) => {
+      await useApp(url, dir, async (app) => {
+        expect((await app.addPlugin({ package: spec })).name).toBe(name);
+      });
+      await useApp(url, dir, async (app) => {
+        expect(app.registry.getAxis(axis).name).toBe(axis);
+      });
+    });
+  });
+
+  it('accepts an absolute path spec', async () => {
+    await withEnv(async ({ url, dir }) => {
+      await useApp(url, dir, async (app) => {
+        expect((await app.addPlugin({ package: join(dir, 'local', 'sun.js') })).name).toBe('sun');
+      });
+    });
+  });
+
+  it.each(['../x', 'a/../../b', '@acme', '@acme/a/b', 'a//b', 'a\b', '@/x'])('rejects bad name %s', async (spec) => {
+    await withEnv(async ({ url, dir }) => {
+      await useApp(url, dir, async (app) => {
+        await expect(app.addPlugin({ package: spec })).rejects.toMatchObject({ code: 'invalid_plugin' });
+      });
+    });
+  });
+
+  it('addPlugin of a throwing module or invalid package.json is invalid_plugin', async () => {
+    await withEnv(async ({ url, dir }) => {
+      await useApp(url, dir, async (app) => {
+        await expect(app.addPlugin({ package: './thrower' })).rejects.toMatchObject({ code: 'invalid_plugin' });
+        await expect(app.addPlugin({ package: './badjson' })).rejects.toMatchObject({ code: 'invalid_plugin' });
+      });
+    });
+  });
+
+  it('looks up package names under plain node (no vitest)', async () => {
+    const dir = await fixtures();
+    try {
+      const locate = pathToFileURL(resolve(__dirname, '../src/plugins/locate.ts')).href;
+      const script = `
+        import { stat } from 'node:fs/promises';
+        const { locateEntry } = await import(${JSON.stringify(locate)});
+        const isDir = async (p) => (await stat(p)).isDirectory();
+        const out = [];
+        for (const s of ['remora-plugin-moon', '@acme/remora-plugin-tide', './pkgdir']) {
+          out.push(await locateEntry(${JSON.stringify(dir)}, s, isDir));
+        }
+        console.log(JSON.stringify(out));`;
+      const { stdout } = await promisify(execFile)(process.execPath, ['--experimental-strip-types', '--input-type=module', '-e', script]);
+      expect((JSON.parse(stdout) as string[]).map((p) => p.replaceAll(String.fromCharCode(92), "/").slice(dir.length + 1))).toEqual([
+        'node_modules/remora-plugin-moon/index.js',
+        'node_modules/@acme/remora-plugin-tide/tide.js',
+        'pkgdir/main.js',
+      ]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });
