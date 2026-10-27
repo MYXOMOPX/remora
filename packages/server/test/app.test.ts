@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import corePlugin from '@remora/core-plugin';
 import { startRemora } from '../src/app.js';
+import { mapPgError } from '../src/api/apply.js';
 import { createEntity, findEntities } from '../src/services/entities.js';
 import { createPropertyType, listPropertyTypes, listTimeAxes } from '../src/services/dictionaries.js';
 import type { Importer } from '../src/plugins/registry.js';
@@ -74,6 +75,57 @@ describe('startRemora', () => {
         code: 'invalid_plugin',
       });
     });
+  });
+
+  it('starts without an importer: the core plugin is bundled', async () => {
+    await withUrl(async (url) => {
+      const app = await startRemora({ databaseUrl: url });
+      try {
+        expect((await listTimeAxes(app.pool)).map((a) => a.name)).toEqual(['game_day', 'real', 'story']);
+      } finally {
+        await app.close();
+      }
+    });
+  });
+
+  it('concurrent starts on one fresh database serialise on the startup lock', async () => {
+    for (let i = 0; i < 3; i++) {
+      await withUrl(async (url) => {
+        const [a, b] = await Promise.all([startRemora({ databaseUrl: url }), startRemora({ databaseUrl: url })]);
+        try {
+          const mig = await a.pool.query('SELECT count(*)::int AS n FROM schema_migration');
+          const plug = await a.pool.query('SELECT count(*)::int AS n FROM plugin');
+          expect(mig.rows[0].n).toBe(2);
+          expect(plug.rows[0].n).toBe(1);
+        } finally {
+          await a.close();
+          await b.close();
+        }
+      });
+    }
+  });
+
+  it('close() is idempotent', async () => {
+    await withUrl(async (url) => {
+      const app = await startRemora({ databaseUrl: url });
+      await app.close();
+      await expect(app.close()).resolves.toBeUndefined();
+    });
+  });
+
+  it('statementTimeoutMs applies to pool queries (57014)', async () => {
+    await withUrl(async (url) => {
+      const app = await startRemora({ databaseUrl: url, statementTimeoutMs: 100 });
+      try {
+        await expect(app.pool.query('SELECT pg_sleep(1)')).rejects.toMatchObject({ code: '57014' });
+      } finally {
+        await app.close();
+      }
+    });
+  });
+
+  it('mapPgError maps 57014 to timeout', () => {
+    expect(mapPgError({ code: '57014' })?.code).toBe('timeout');
   });
 
   it('fails on an unreachable database without hanging', async () => {

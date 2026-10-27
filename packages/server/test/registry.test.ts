@@ -227,12 +227,70 @@ describe('plugin registry', () => {
     });
   });
 
-  it('two plugins declaring the same axis name abort startup', async () => {
+  it('a non-core plugin declaring an axis owned by another plugin is degraded with name_taken', async () => {
+    await withDb(async (pool) => {
+      await insertPlugin(pool, 'p1');
+      await insertPlugin(pool, 'p2');
+      const logger = { warn: vi.fn(), error: vi.fn() };
+      const reg = await loadPlugins(pool, {
+        importer: importerOf({ p1: plug('p1', ['day']), p2: plug('p2', ['day', 'other']) }),
+        logger,
+      });
+      expect(reg.status()).toEqual([
+        { name: 'p1', ok: true },
+        { name: 'p2', ok: false, error: expect.stringContaining('name_taken') },
+      ]);
+      expect(reg.getAxis('day').def.name).toBe('day');
+      const { rows } = await pool.query(
+        `SELECT a.name FROM time_axis a JOIN plugin p ON p.id = a.plugin_id WHERE p.name = 'p2'`,
+      );
+      expect(rows).toEqual([]);
+      expect(() => reg.getAxis('other')).toThrow(code('unknown_axis'));
+    });
+  });
+
+  it('a package whose name differs from its row is degraded with invalid_plugin', async () => {
+    await withDb(async (pool) => {
+      await insertPlugin(pool, 'p2');
+      await pool.query(
+        `INSERT INTO time_axis (name, plugin_id, description, value_schema, example)
+         SELECT 'old_axis', id, 'x', '{"type":"integer"}', '1' FROM plugin WHERE name = 'p2'`,
+      );
+      const reg = await loadPlugins(pool, {
+        importer: importerOf({ p2: plug('other', ['new_axis']) }),
+        logger: { warn: vi.fn(), error: vi.fn() },
+      });
+      expect(reg.status()).toEqual([
+        { name: 'p2', ok: false, error: expect.stringContaining('invalid_plugin') },
+      ]);
+      expect(() => reg.getAxis('old_axis')).toThrow(code('axis_unavailable'));
+      expect(() => reg.getAxis('new_axis')).toThrow(code('unknown_axis'));
+    });
+  });
+
+  it('duplicate axis names inside one setup result are invalid_plugin', async () => {
+    await withDb(async (pool) => {
+      await insertPlugin(pool, 'p3');
+      const reg = await loadPlugins(pool, {
+        importer: importerOf({ p3: plug('p3', ['x', 'x']) }),
+        logger: { warn: vi.fn(), error: vi.fn() },
+      });
+      expect(reg.status()).toEqual([
+        { name: 'p3', ok: false, error: expect.stringContaining('invalid_plugin') },
+      ]);
+      const { rows } = await pool.query('SELECT 1 FROM time_axis');
+      expect(rows).toEqual([]);
+    });
+  });
+
+  it('a core plugin declaring an axis owned by another plugin aborts with name_taken', async () => {
     await withDb(async (pool) => {
       await insertPlugin(pool, 'a');
-      await insertPlugin(pool, 'b');
+      await insertPlugin(pool, 'remora-core');
       await expect(
-        loadPlugins(pool, { importer: importerOf({ a: plug('a', ['day']), b: plug('b', ['day']) }) }),
+        loadPlugins(pool, {
+          importer: importerOf({ a: plug('a', ['day']), 'remora-core': plug('remora-core', ['day']) }),
+        }),
       ).rejects.toMatchObject({ code: 'name_taken' });
     });
   });

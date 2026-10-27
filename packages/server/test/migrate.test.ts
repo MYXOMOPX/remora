@@ -18,6 +18,23 @@ describe('runMigrations', () => {
     }
   });
 
+  it('accepts a pool client and applies both migrations once', async () => {
+    const { pool, drop } = await createTestDb();
+    try {
+      const client = await pool.connect();
+      try {
+        expect(await runMigrations(client)).toEqual(['001_init.sql', '002_relation_logical_id_seq.sql']);
+        expect(await runMigrations(client)).toEqual([]);
+      } finally {
+        client.release();
+      }
+      const { rows } = await pool.query('SELECT name FROM schema_migration ORDER BY name');
+      expect(rows).toHaveLength(2);
+    } finally {
+      await drop();
+    }
+  });
+
   it('rolls back a failing migration and keeps earlier ones', async () => {
     const { pool, drop } = await createTestDb();
     try {

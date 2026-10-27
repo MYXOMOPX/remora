@@ -1,10 +1,10 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
-import type { Pool } from 'pg';
+import pg from 'pg';
 
 const defaultDir = fileURLToPath(new URL('../../migrations', import.meta.url));
 
-export async function runMigrations(pool: Pool, dir: string = defaultDir): Promise<string[]> {
+export async function runMigrations(pool: pg.Pool | pg.PoolClient, dir: string = defaultDir): Promise<string[]> {
   await pool.query(
     `CREATE TABLE IF NOT EXISTS schema_migration (
        name text PRIMARY KEY,
@@ -19,7 +19,8 @@ export async function runMigrations(pool: Pool, dir: string = defaultDir): Promi
   for (const file of files) {
     if (applied.has(file)) continue;
     const sql = await readFile(`${dir}/${file}`, 'utf8');
-    const client = await pool.connect();
+    // a pool hands out a client per migration; a client runs BEGIN..COMMIT on itself
+    const client = pool instanceof pg.Pool ? await pool.connect() : pool;
     try {
       await client.query('BEGIN');
       await client.query(sql);
@@ -30,7 +31,7 @@ export async function runMigrations(pool: Pool, dir: string = defaultDir): Promi
       await client.query('ROLLBACK').catch(() => {});
       throw err;
     } finally {
-      client.release();
+      if (client !== pool) (client as pg.PoolClient).release();
     }
   }
   return done;

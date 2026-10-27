@@ -34,6 +34,8 @@ export function mapPgError(e: unknown): RemoraError | null {
     case '40001':
     case '40P01':
       return new RemoraError('concurrent_update', 'concurrent update, retry the batch');
+    case '57014':
+      return new RemoraError('timeout', 'statement timeout exceeded; the batch was rolled back, narrow the request');
     case '23503':
       return new RemoraError('invalid_param', 'referenced row does not exist');
     default:

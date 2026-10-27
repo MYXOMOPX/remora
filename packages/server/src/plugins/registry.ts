@@ -35,7 +35,7 @@ export interface PluginRegistry {
   status(): { name: string; ok: boolean; error?: string }[];
 }
 
-const defaultImporter: Importer = async (spec) => ((await import(spec)) as { default: unknown }).default;
+export const defaultImporter: Importer = async (spec) => ((await import(spec)) as { default: unknown }).default;
 
 const addFormats = addFormatsModule.default;
 const ajv = new Ajv();
@@ -180,10 +180,17 @@ export async function loadPlugins(
         if (e instanceof RemoraError) throw e;
         throw new RemoraError('invalid_plugin', `cannot load package ${p.package}: ${errMsg(e)}`);
       }
+      if (def.name !== p.name) {
+        throw new RemoraError('invalid_plugin', `package ${p.package} exports plugin ${def.name}, expected ${p.name}`);
+      }
       checkConfig(def, p.config, `stored config of ${p.name}`);
       setupResult = validateSetupResult(def.setup(p.config), p.name);
+      assertUniqueNames(setupResult, p.name);
+      for (const a of setupResult.timeAxes ?? []) await assertNameFree(db, 'time_axis', a.name, p.id);
+      for (const s of setupResult.evidenceSources ?? []) await assertNameFree(db, 'evidence_source', s.name, p.id);
     } catch (e) {
       if (p.name === CORE_PLUGIN_NAME) {
+        if (e instanceof RemoraError && e.code === 'name_taken') throw e;
         throw new RemoraError('invalid_plugin', `core plugin ${CORE_PLUGIN_NAME} failed to load: ${errMsg(e)}`);
       }
       const error = e instanceof RemoraError ? `${e.code}: ${e.message}` : errMsg(e);
@@ -195,7 +202,6 @@ export async function loadPlugins(
     }
 
     for (const a of setupResult.timeAxes ?? []) {
-      await assertNameFree(db, 'time_axis', a.name, p.id);
       const r = await db.query<{ id: number }>(
         `INSERT INTO time_axis (name, plugin_id, description, value_schema, example)
          VALUES ($1, $2, $3, $4::jsonb, $5::jsonb)
@@ -209,7 +215,6 @@ export async function loadPlugins(
       axes.set(a.name, { id: r.rows[0]!.id, name: a.name, def: a });
     }
     for (const s of setupResult.evidenceSources ?? ([] as EvidenceSourceDef[])) {
-      await assertNameFree(db, 'evidence_source', s.name, p.id);
       const r = await db.query<{ id: number }>(
         `INSERT INTO evidence_source (name, plugin_id, description, payload_schema)
          VALUES ($1, $2, $3, $4::jsonb)
@@ -267,6 +272,21 @@ export async function loadPlugins(
     },
     status: () => statuses.map((s) => ({ ...s })),
   };
+}
+
+function assertUniqueNames(setup: ReturnType<PluginDef['setup']>, plugin: string): void {
+  for (const [what, list] of [
+    ['time axis', setup.timeAxes ?? []],
+    ['evidence source', setup.evidenceSources ?? []],
+  ] as const) {
+    const seen = new Set<string>();
+    for (const x of list) {
+      if (seen.has(x.name)) {
+        throw new RemoraError('invalid_plugin', `plugin ${plugin} declares ${what} ${x.name} twice`);
+      }
+      seen.add(x.name);
+    }
+  }
 }
 
 async function assertNameFree(
